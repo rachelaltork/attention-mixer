@@ -223,21 +223,16 @@
 
   <!-- SMARTSHEET PANEL -->
   <div class="panel" id="settings-panel">
-    <h3>Smartsheet connection</h3>
+    <h3>Smartsheet connection via Make.com</h3>
     <p style="font-size:13px;color:var(--color-text-secondary);margin-bottom:14px;line-height:1.6;">
-      Each saved entry will automatically post a new timestamped row to your Smartsheet.<br>
-      Your credentials are stored only in your browser's localStorage — never sent anywhere except Smartsheet's own API.
+      Each saved entry posts to your Make.com webhook, which forwards it to Smartsheet automatically.<br>
+      Your webhook URL is stored in your browser's localStorage.
     </p>
     <div style="display:grid;gap:12px;margin-bottom:10px;">
       <div class="field">
-        <label>API token</label>
-        <div class="hint" style="margin-bottom:6px;">Smartsheet → Account (bottom left) → Personal Settings → API Access → Generate new token</div>
-        <input type="password" id="ss-token" placeholder="Paste your API token here">
-      </div>
-      <div class="field">
-        <label>Sheet ID</label>
-        <div class="hint" style="margin-bottom:6px;">Open your sheet in Smartsheet → File → Properties → Sheet ID</div>
-        <input type="text" id="ss-sheet-id" placeholder="e.g. 3932034054455172">
+        <label>Make.com webhook URL</label>
+        <div class="hint" style="margin-bottom:6px;">From your Make scenario → Custom webhook module → copy the webhook URL</div>
+        <input type="text" id="ss-webhook" placeholder="https://hook.us2.make.com/...">
       </div>
     </div>
     <div id="ss-status-bar" style="display:none;" class="ss-status-bar"></div>
@@ -309,8 +304,7 @@ let activeTags = new Set();
 let logFilter = 'all';
 let nextId = 17;
 let weekOffset = 0;
-let ssToken = '';
-let ssSheetId = '';
+let ssWebhook = 'https://hook.us2.make.com/88giht9207eu9ai1a4dflw6i3lmpqigi';
 
 // ── Persistence (localStorage) ────────────────────────────────────────────
 function saveToStorage() {
@@ -326,13 +320,12 @@ function loadFromStorage() {
     const p = localStorage.getItem('am_projects');
     const e = localStorage.getItem('am_entries');
     const n = localStorage.getItem('am_nextId');
-    const t = localStorage.getItem('am_ss_token');
-    const s = localStorage.getItem('am_ss_sheet');
+    const w = localStorage.getItem('am_ss_webhook');
     if (p) projects = JSON.parse(p);
     if (e) entries = JSON.parse(e);
     if (n) nextId = parseInt(n);
-    if (t) { ssToken = t; document.getElementById('ss-token').value = t; }
-    if (s) { ssSheetId = s; document.getElementById('ss-sheet-id').value = s; }
+    if (w) { ssWebhook = w; document.getElementById('ss-webhook').value = w; }
+    else { document.getElementById('ss-webhook').value = ssWebhook; }
   } catch(e) {}
 }
 
@@ -573,7 +566,7 @@ async function saveEntry() {
   entries.push(entry);
   saveToStorage();
   closeAll();
-  if (ssToken && ssSheetId) {
+  if (ssWebhook) {
     entry.ssStatus = 'pending'; renderLog();
     const ok = await postToSS(entry);
     entry.ssStatus = ok ? 'ok' : 'fail';
@@ -586,21 +579,23 @@ async function saveEntry() {
 async function postToSS(entry) {
   const p = projects.find(x => x.id === entry.pid);
   const d = new Date(entry.ts);
-  const body = { rows: [{ cells: [
-    { columnId: null, value: p ? p.name : '' },
-    { columnId: null, value: p ? p.cadence : '' },
-    { columnId: null, value: d.toISOString() },
-    { columnId: null, value: entry.minutes },
-    { columnId: null, value: entry.intensity },
-    { columnId: null, value: entry.au },
-    { columnId: null, value: (entry.tags || []).join(', ') },
-    { columnId: null, value: entry.enjoyed ? 'Yes' : 'No' },
-    { columnId: null, value: entry.notes }
-  ]}]};
+  const body = {
+    project:   p ? p.name : '',
+    cadence:   p ? p.cadence : '',
+    datetime:  d.toISOString(),
+    date:      d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+    time:      d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+    minutes:   entry.minutes,
+    intensity: entry.intensity,
+    au:        entry.au,
+    tags:      (entry.tags || []).join(', '),
+    enjoyed:   entry.enjoyed ? 'Yes' : 'No',
+    notes:     entry.notes
+  };
   try {
-    const r = await fetch(`https://api.smartsheet.com/2.0/sheets/${ssSheetId}/rows`, {
+    const r = await fetch(ssWebhook, {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + ssToken, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     return r.ok;
@@ -608,33 +603,31 @@ async function postToSS(entry) {
 }
 
 async function testSS() {
-  const token = document.getElementById('ss-token').value.trim();
-  const sheetId = document.getElementById('ss-sheet-id').value.trim();
+  const webhook = document.getElementById('ss-webhook').value.trim();
   const bar = document.getElementById('ss-status-bar');
-  bar.style.display = 'block'; bar.className = 'ss-status-bar'; bar.textContent = 'Testing connection…';
+  bar.style.display = 'block'; bar.className = 'ss-status-bar'; bar.textContent = 'Sending test ping…';
   try {
-    const r = await fetch(`https://api.smartsheet.com/2.0/sheets/${sheetId}`, { headers: { 'Authorization': 'Bearer ' + token } });
+    const r = await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ test: true, source: 'attention-mixer', datetime: new Date().toISOString() })
+    });
     if (r.ok) {
-      const data = await r.json();
       bar.className = 'ss-status-bar ss-ok-bar';
-      bar.textContent = 'Connected ✓ — sheet "' + data.name + '" found with ' + (data.columns ? data.columns.length : 0) + ' columns.';
+      bar.textContent = 'Webhook reached ✓ — check your Make scenario to confirm it received the ping, then finish mapping to Smartsheet.';
     } else {
       bar.className = 'ss-status-bar ss-fail-bar';
-      bar.textContent = 'Failed (' + r.status + '). Check your token and sheet ID.';
+      bar.textContent = 'Webhook returned an error (' + r.status + '). Double-check the URL.';
     }
   } catch(e) {
     bar.className = 'ss-status-bar ss-fail-bar';
-    bar.textContent = 'Could not reach Smartsheet. Check your credentials.';
+    bar.textContent = 'Could not reach the webhook. Check the URL and that your Make scenario is active.';
   }
 }
 
 function saveSS() {
-  ssToken = document.getElementById('ss-token').value.trim();
-  ssSheetId = document.getElementById('ss-sheet-id').value.trim();
-  try {
-    localStorage.setItem('am_ss_token', ssToken);
-    localStorage.setItem('am_ss_sheet', ssSheetId);
-  } catch(e) {}
+  ssWebhook = document.getElementById('ss-webhook').value.trim();
+  try { localStorage.setItem('am_ss_webhook', ssWebhook); } catch(e) {}
   closeAll();
 }
 
