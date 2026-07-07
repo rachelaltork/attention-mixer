@@ -5,6 +5,748 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Attention Mixer</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getFirestore, collection, addDoc, getDocs, query, orderBy, doc, setDoc, getDoc, writeBatch } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCKpvRD23G14pHk_FPQ89zSq1LHwJUeD0A",
+  authDomain: "tork-command-center.firebaseapp.com",
+  projectId: "tork-command-center",
+  storageBucket: "tork-command-center.firebasestorage.app",
+  messagingSenderId: "189074200526",
+  appId: "1:189074200526:web:4890e49e177140605cfd9f"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+const WEBHOOK = 'https://hook.us2.make.com/88giht9207eu9ai1a4dflw6i3lmpqigi';
+const SS_LOG_SHEET = '7009147244466052';
+const SS_DASH_SHEET = '6368240816050052';
+const AU_CEIL = 100;
+const FADER_H = 120;
+const TICK_AU = [25, 50, 75];
+
+const CHANNELS = [
+  // Priority tier 1 - weekly
+  { id:'intake',    name:'Intake',             cadence:'weekly',  priority:1, goal:10,  label:'Intake'   },
+  { id:'extacct',   name:'External Acct Mgmt', cadence:'weekly',  priority:1, goal:10,  label:'ExtAcct'  },
+  { id:'billing',   name:'Billing',            cadence:'weekly',  priority:1, goal:10,  label:'Billing'  },
+  { id:'email',     name:'Email Support',      cadence:'weekly',  priority:1, goal:10,  label:'Email'    },
+  // Priority tier 1 - monthly
+  { id:'accounting',name:'Accounting',         cadence:'monthly', priority:1, goal:4,   label:'Acctg'    },
+  { id:'website',   name:'Website',            cadence:'monthly', priority:1, goal:4,   label:'Web'      },
+  { id:'marketing', name:'Marketing',          cadence:'monthly', priority:1, goal:1,   label:'Mktg'     },
+  // Regular - weekly
+  { id:'sysmaint',  name:'Systems Maintenance',cadence:'weekly',  priority:2, goal:4,   label:'SysMnt'   },
+  { id:'coursepl',  name:'Build Course Platform',cadence:'weekly',priority:2, goal:4,   label:'Course'   },
+  { id:'kiosk',     name:'Kiosk',              cadence:'weekly',  priority:2, goal:4,   label:'Kiosk'    },
+  // Regular - monthly
+  { id:'cpc',       name:'CPC',                cadence:'monthly', priority:2, goal:3,   label:'CPC'      },
+  { id:'sopdocs',   name:'SOP Docs',           cadence:'monthly', priority:2, goal:2,   label:'SOPDocs'  },
+  { id:'dashboards',name:'Dashboards',         cadence:'monthly', priority:2, goal:1,   label:'Dash'     },
+  { id:'projmgmt',  name:'Proj Mgmt',          cadence:'monthly', priority:2, goal:1,   label:'ProjMgt'  },
+  { id:'imserc',    name:'IMSERC Committee',   cadence:'monthly', priority:2, goal:1,   label:'IMSERC'   },
+  { id:'wkshp',     name:'Wkshp & Education',  cadence:'monthly', priority:2, goal:1,   label:'Wkshp'    },
+];
+
+const COLORS = {
+  weekly:  { p1:'#185FA5', p2:'#378ADD', low:'#B5D4F4', overflow:'#BA7517' },
+  monthly: { p1:'#085041', p2:'#1D9E75', low:'#9FE1CB', overflow:'#BA7517' }
+};
+
+const CHART_COLORS = [
+  '#185FA5','#1D9E75','#BA7517','#7B3FA0',
+  '#C0392B','#2980B9','#27AE60','#F39C12',
+  '#8E44AD','#16A085','#D35400','#2C3E50',
+  '#E74C3C','#3498DB','#2ECC71','#E67E22'
+];
+
+let entries = [];
+let snapshots = [];
+let weekOffset = 0;
+let selectedChannel = null;
+let activeTags = new Set();
+let logFilter = 'all';
+let bottomChartVisible = false;
+let bottomChart = null;
+let sparklineChart = null;
+
+// ── Time helpers ──────────────────────────────────────────────────────────
+function weekBounds(offset) {
+  const now = new Date();
+  const day = now.getDay();
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - ((day + 6) % 7) + offset * 7);
+  monday.setHours(0,0,0,0);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  sunday.setHours(23,59,59,999);
+  return { start: monday, end: sunday };
+}
+
+function weekLabel(offset) {
+  if (offset === 0) return 'This week';
+  if (offset === -1) return 'Last week';
+  const { start, end } = weekBounds(offset);
+  const fmt = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return fmt(start) + ' – ' + fmt(end);
+}
+
+function periodKey(channel, date) {
+  const d = date || new Date();
+  if (channel.cadence === 'weekly') {
+    const day = d.getDay();
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - ((day + 6) % 7));
+    return `week-${monday.toISOString().slice(0,10)}`;
+  } else {
+    return `month-${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+  }
+}
+
+function periodLabel(channel, date) {
+  const d = date || new Date();
+  if (channel.cadence === 'weekly') {
+    const day = d.getDay();
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - ((day + 6) % 7));
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    const fmt = x => x.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return `Week of ${fmt(monday)}`;
+  } else {
+    return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  }
+}
+
+function channelAU(channelId, offset) {
+  const { start, end } = weekBounds(offset);
+  return entries
+    .filter(e => e.channelId === channelId && e.ts >= start.getTime() && e.ts <= end.getTime())
+    .reduce((s, e) => s + e.au, 0);
+}
+
+function auScore(min, intensity) {
+  return Math.round((min / 30) * (intensity / 10) * 5 * 100) / 100;
+}
+
+function auToFaderPct(au) {
+  if (au <= 0) return 0;
+  return Math.sqrt(Math.min(au, AU_CEIL) / AU_CEIL);
+}
+
+function paceStatus(channel, au) {
+  const now = new Date();
+  let pctElapsed;
+  if (channel.cadence === 'weekly') {
+    const day = now.getDay();
+    const dayOfWeek = day === 0 ? 7 : day;
+    pctElapsed = (dayOfWeek - 1) / 7;
+  } else {
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+    pctElapsed = (now.getDate() - 1) / daysInMonth;
+  }
+  const expected = channel.goal * pctElapsed;
+  if (au === 0 && pctElapsed > 0.2) return 'neglected';
+  if (au > channel.goal) return 'overflow';
+  if (au >= expected * 0.8) return 'on-track';
+  if (au >= expected * 0.4) return 'at-risk';
+  return 'neglected';
+}
+
+// ── Firebase ──────────────────────────────────────────────────────────────
+async function loadFromFirebase() {
+  try {
+    showToast('Loading data…');
+    const eSnap = await getDocs(query(collection(db, 'attention-mixer-entries'), orderBy('ts', 'desc')));
+    entries = eSnap.docs.map(d => ({ fbId: d.id, ...d.data() }));
+    const sSnap = await getDocs(collection(db, 'attention-mixer-snapshots'));
+    snapshots = sSnap.docs.map(d => ({ fbId: d.id, ...d.data() }));
+    render();
+    showToast('Data loaded ✓', 'ok');
+  } catch(e) {
+    showToast('Could not load Firebase data', 'err');
+    console.error(e);
+  }
+}
+
+async function saveEntry(entry) {
+  try {
+    const ref = await addDoc(collection(db, 'attention-mixer-entries'), entry);
+    entry.fbId = ref.id;
+    return true;
+  } catch(e) {
+    console.error(e);
+    return false;
+  }
+}
+
+// ── Smartsheet via Make ───────────────────────────────────────────────────
+async function postEntryToSmartsheet(entry, channel) {
+  const d = new Date(entry.ts);
+  const body = {
+    type: 'entry',
+    sheetId: SS_LOG_SHEET,
+    channel: channel.name,
+    cadence: channel.cadence,
+    period: periodLabel(channel, d),
+    periodKey: periodKey(channel, d),
+    datetime: d.toISOString(),
+    date: d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }),
+    time: d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' }),
+    minutes: entry.minutes,
+    intensity: entry.intensity,
+    au: entry.au,
+    tags: (entry.tags || []).join(', '),
+    enjoyed: entry.enjoyed ? 'Yes' : 'No',
+    notes: entry.notes || ''
+  };
+  try {
+    await fetch(WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  } catch(e) {}
+}
+
+async function postSnapshotToSmartsheet(snapshot, channel) {
+  const body = {
+    type: 'snapshot',
+    sheetId: SS_LOG_SHEET,
+    dashSheetId: SS_DASH_SHEET,
+    channel: channel.name,
+    cadence: channel.cadence,
+    period: snapshot.periodLabel,
+    periodStart: snapshot.periodStart,
+    periodEnd: snapshot.periodEnd,
+    totalAU: snapshot.totalAU,
+    totalMinutes: snapshot.totalMinutes,
+    sessions: snapshot.sessions,
+    avgIntensity: snapshot.avgIntensity,
+    enjoyedPct: snapshot.enjoyedPct,
+    dominantTag: snapshot.dominantTag,
+    goal: channel.goal,
+    priority: channel.priority
+  };
+  try {
+    await fetch(WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  } catch(e) {}
+}
+
+// ── Snapshot logic ────────────────────────────────────────────────────────
+async function checkAndCreateSnapshots() {
+  const now = new Date();
+  for (const ch of CHANNELS) {
+    const key = periodKey(ch, now);
+    const prevDate = new Date(now);
+    if (ch.cadence === 'weekly') {
+      prevDate.setDate(prevDate.getDate() - 7);
+    } else {
+      prevDate.setMonth(prevDate.getMonth() - 1);
+    }
+    const prevKey = periodKey(ch, prevDate);
+    const snapId = `${ch.id}-${prevKey}`;
+    const exists = snapshots.find(s => s.id === snapId);
+    if (exists) continue;
+    const { start, end } = ch.cadence === 'weekly'
+      ? weekBounds(-1)
+      : { start: new Date(prevDate.getFullYear(), prevDate.getMonth(), 1), end: new Date(prevDate.getFullYear(), prevDate.getMonth()+1, 0, 23, 59, 59) };
+    const periodEntries = entries.filter(e =>
+      e.channelId === ch.id && e.ts >= start.getTime() && e.ts <= end.getTime()
+    );
+    if (periodEntries.length === 0 && ch.cadence === 'weekly') {
+      // still record zero snapshot
+    }
+    const totalAU = periodEntries.reduce((s, e) => s + e.au, 0);
+    const totalMinutes = periodEntries.reduce((s, e) => s + e.minutes, 0);
+    const sessions = periodEntries.length;
+    const avgIntensity = sessions ? +(periodEntries.reduce((s, e) => s + e.intensity, 0) / sessions).toFixed(1) : 0;
+    const enjoyedPct = sessions ? Math.round(periodEntries.filter(e => e.enjoyed).length / sessions * 100) : 0;
+    const tagCounts = {};
+    periodEntries.forEach(e => (e.tags||[]).forEach(t => tagCounts[t] = (tagCounts[t]||0)+1));
+    const dominantTag = Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] || '';
+    const snapshot = {
+      id: snapId, channelId: ch.id, periodKey: prevKey,
+      periodLabel: periodLabel(ch, prevDate),
+      periodStart: start.toISOString(), periodEnd: end.toISOString(),
+      totalAU, totalMinutes, sessions, avgIntensity, enjoyedPct, dominantTag,
+      createdAt: Date.now()
+    };
+    try {
+      await setDoc(doc(db, 'attention-mixer-snapshots', snapId), snapshot);
+      snapshots.push({ fbId: snapId, ...snapshot });
+      await postSnapshotToSmartsheet(snapshot, ch);
+    } catch(e) { console.error(e); }
+  }
+}
+
+function getChannelHistory(channelId, months) {
+  const ch = CHANNELS.find(c => c.id === channelId);
+  if (!ch) return [];
+  const now = new Date();
+  const result = [];
+  if (ch.cadence === 'weekly') {
+    for (let w = months * 4; w >= 1; w--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - w * 7);
+      const key = periodKey(ch, d);
+      const snap = snapshots.find(s => s.channelId === channelId && s.periodKey === key);
+      result.push({ label: periodLabel(ch, d), au: snap ? snap.totalAU : 0, key });
+    }
+  } else {
+    for (let m = months - 1; m >= 0; m--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - m, 1);
+      const key = periodKey(ch, d);
+      const snap = snapshots.find(s => s.channelId === channelId && s.periodKey === key);
+      result.push({ label: periodLabel(ch, d), au: snap ? snap.totalAU : 0, key });
+    }
+  }
+  return result;
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (type === 'ok' ? ' ok' : type === 'err' ? ' err' : '');
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ── Render ────────────────────────────────────────────────────────────────
+function render() {
+  renderWeekNav();
+  renderSummary();
+  renderMixer();
+  renderLog();
+  if (bottomChartVisible) renderBottomChart();
+}
+
+function renderWeekNav() {
+  document.getElementById('week-label').textContent = weekLabel(weekOffset);
+  const nb = document.getElementById('next-btn');
+  nb.style.opacity = weekOffset >= 0 ? '0.3' : '1';
+  nb.style.pointerEvents = weekOffset >= 0 ? 'none' : 'auto';
+}
+
+function renderSummary() {
+  const zc = CHANNELS.filter(c => channelAU(c.id, weekOffset) === 0).length;
+  const oc = CHANNELS.filter(c => channelAU(c.id, weekOffset) > AU_CEIL).length;
+  const { start, end } = weekBounds(weekOffset);
+  const wE = entries.filter(e => e.ts >= start.getTime() && e.ts <= end.getTime());
+  const total = wE.reduce((s, e) => s + e.au, 0);
+  const avgInt = wE.length ? (wE.reduce((s, e) => s + e.intensity, 0) / wE.length).toFixed(1) : '—';
+  const enjoyPct = wE.length ? Math.round(wE.filter(e => e.enjoyed).length / wE.length * 100) + '%' : '—';
+  document.getElementById('summary-row').innerHTML = `
+    <div class="metric"><div class="metric-label">Channels</div><div class="metric-value">${CHANNELS.length}</div></div>
+    <div class="metric"><div class="metric-label">Needs attention</div><div class="metric-value" style="color:${zc>0?'#A32D2D':'var(--color-text-primary)'}">${zc}</div></div>
+    <div class="metric"><div class="metric-label">Overflowing</div><div class="metric-value" style="color:${oc>0?'#BA7517':'var(--color-text-primary)'}">${oc}</div></div>
+    <div class="metric"><div class="metric-label">Total AU</div><div class="metric-value">${total.toFixed(1)}</div></div>
+    <div class="metric"><div class="metric-label">Enjoyed</div><div class="metric-value" style="color:#0F6E56;">${enjoyPct}</div></div>`;
+}
+
+function renderMixer() {
+  const mx = document.getElementById('mixer');
+  mx.innerHTML = '';
+
+  // Two rows: weekly (priority left, regular right), monthly (priority left, regular right)
+  const weekly  = [
+    ...CHANNELS.filter(c => c.cadence === 'weekly'  && c.priority === 1),
+    ...CHANNELS.filter(c => c.cadence === 'weekly'  && c.priority === 2),
+  ];
+  const monthly = [
+    ...CHANNELS.filter(c => c.cadence === 'monthly' && c.priority === 1),
+    ...CHANNELS.filter(c => c.cadence === 'monthly' && c.priority === 2),
+  ];
+
+  function makeRow(label, channels) {
+    if (!channels.length) return;
+    const section = document.createElement('div');
+    section.className = 'mixer-section';
+    const sLabel = document.createElement('div');
+    sLabel.className = 'section-label';
+    sLabel.textContent = label;
+    section.appendChild(sLabel);
+    const row = document.createElement('div');
+    row.className = 'channel-row';
+    channels.forEach(ch => {
+      const vol = channelAU(ch.id, weekOffset);
+      row.appendChild(makeChannel(ch, vol, ch.priority === 1));
+    });
+    section.appendChild(row);
+    mx.appendChild(section);
+  }
+
+  makeRow('Weekly', weekly);
+  makeRow('Monthly', monthly);
+}
+
+function makeChannel(ch, vol, isPriority) {
+  const isOverflow = vol > AU_CEIL;
+  const isZero = vol === 0;
+  const status = paceStatus(ch, vol);
+  const c = COLORS[ch.cadence];
+  const fillColor = isOverflow ? c.overflow : (vol < AU_CEIL * 0.15 ? c.low : (ch.priority === 1 ? c.p1 : c.p2));
+  const pct = auToFaderPct(vol);
+  const fH = isPriority ? FADER_H * 2 : FADER_H;
+  const fillPx = Math.max(Math.round(pct * fH), isZero ? 0 : 2);
+
+  const tubeW = isPriority ? 40 : 24;
+  const ticksHTML = TICK_AU.map(t => {
+    const tPct = auToFaderPct(t);
+    const bottomPx = Math.round(tPct * fH);
+    return `<div class="tick" style="bottom:${bottomPx}px;left:0;right:0;">
+      <div class="tick-line"></div>
+      <div class="tick-val">${t}</div>
+    </div>`;
+  }).join('');
+
+  // Goal line
+  const goalPct = auToFaderPct(ch.goal);
+  const goalPx = Math.round(goalPct * fH);
+  const goalLine = `<div class="goal-line" style="bottom:${goalPx}px;" title="Weekly goal: ${ch.goal} AU"></div>`;
+
+  const statusDot = status === 'neglected' ? '<div class="alert-dot" title="Needs attention"></div>'
+    : status === 'overflow' ? '<div class="overflow-dot" title="Overflow"></div>'
+    : status === 'at-risk' ? '<div class="risk-dot" title="At risk"></div>' : '';
+
+  const el = document.createElement('div');
+  el.className = 'channel' + (isPriority ? ' priority' : '') + (selectedChannel === ch.id ? ' selected' : '');
+  el.dataset.channelId = ch.id;
+
+  el.innerHTML = `
+    ${statusDot}
+    <div class="ch-name">${ch.name}</div>
+    <div class="fader-outer" style="height:${fH}px;width:${tubeW+12}px;">
+      ${ticksHTML}
+      ${goalLine}
+      <div class="fader-wrap" style="height:${fH}px;width:${tubeW}px;">
+        <div class="fader-fill" style="height:${fillPx}px;background:${fillColor};border-radius:12px;"></div>
+      </div>
+    </div>
+    <div class="vol-label" style="color:${isOverflow?'#BA7517':isZero?'#A32D2D':'var(--color-text-primary)'};">${vol.toFixed(1)}</div>
+    <div class="goal-label">${ch.goal} AU goal</div>
+    <span class="cadence-badge cadence-${ch.cadence}">${ch.label}</span>
+    ${isZero ? '<div class="zero-warn">needs attn</div>' : ''}
+    ${isOverflow ? '<div class="overflow-warn">overflow</div>' : ''}
+  `;
+
+  el.onclick = () => openLog(ch.id);
+
+  // Hover sparkline
+  el.addEventListener('mouseenter', (e) => showSparkline(ch, e.currentTarget));
+  el.addEventListener('mouseleave', () => hideSparkline());
+
+  return el;
+}
+
+// ── Sparkline ─────────────────────────────────────────────────────────────
+function showSparkline(ch, el) {
+  const history = getChannelHistory(ch.id, 6);
+  const popup = document.getElementById('sparkline-popup');
+  const canvas = document.getElementById('sparkline-canvas');
+  popup.querySelector('.spark-title').textContent = ch.name + ' — last 6 months';
+
+  if (sparklineChart) { sparklineChart.destroy(); sparklineChart = null; }
+
+  const c = COLORS[ch.cadence];
+  const color = ch.priority === 1 ? c.p1 : c.p2;
+
+  sparklineChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: history.map(h => h.label),
+      datasets: [{
+        data: history.map(h => h.au),
+        backgroundColor: history.map(h => h.au >= ch.goal ? color : c.low),
+        borderRadius: 3,
+      }]
+    },
+    options: {
+      responsive: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: ctx => `${ctx.raw.toFixed(1)} AU` }
+        }
+      },
+      scales: {
+        x: { ticks: { font: { size: 9 }, maxRotation: 45 }, grid: { display: false } },
+        y: { ticks: { font: { size: 9 } }, grid: { color: 'rgba(0,0,0,0.05)' },
+          suggestedMax: Math.max(ch.goal * 1.2, ...history.map(h => h.au), 1) }
+      }
+    }
+  });
+
+  const rect = el.getBoundingClientRect();
+  const scrollY = window.scrollY;
+  popup.style.display = 'block';
+  popup.style.left = (rect.right + 8) + 'px';
+  popup.style.top = (rect.top + scrollY) + 'px';
+
+  // Adjust if off screen
+  setTimeout(() => {
+    const pr = popup.getBoundingClientRect();
+    if (pr.right > window.innerWidth - 10) {
+      popup.style.left = (rect.left - pr.width - 8) + 'px';
+    }
+  }, 0);
+}
+
+function hideSparkline() {
+  document.getElementById('sparkline-popup').style.display = 'none';
+}
+
+// ── Bottom chart ──────────────────────────────────────────────────────────
+function toggleBottomChart() {
+  bottomChartVisible = !bottomChartVisible;
+  document.getElementById('bottom-chart-section').style.display = bottomChartVisible ? 'block' : 'none';
+  document.getElementById('chart-toggle-btn').innerHTML = bottomChartVisible
+    ? '<i class="ti ti-chart-line"></i> Hide trends'
+    : '<i class="ti ti-chart-line"></i> Show trends';
+  if (bottomChartVisible) renderBottomChart();
+}
+
+function renderBottomChart() {
+  const canvas = document.getElementById('bottom-chart-canvas');
+  if (bottomChart) { bottomChart.destroy(); bottomChart = null; }
+
+  const months = 6;
+  const now = new Date();
+  const labels = [];
+  for (let m = months - 1; m >= 0; m--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - m, 1);
+    labels.push(d.toLocaleDateString('en-US', { month: 'short', year:'2-digit' }));
+  }
+
+  const datasets = CHANNELS.map((ch, i) => {
+    const history = getChannelHistory(ch.id, months);
+    // For weekly channels, aggregate by month
+    let monthlyData;
+    if (ch.cadence === 'weekly') {
+      monthlyData = [];
+      for (let m = months - 1; m >= 0; m--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - m, 1);
+        const monthKey = `month-${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+        // sum up weekly snapshots in that month
+        const monthSnaps = snapshots.filter(s =>
+          s.channelId === ch.id && s.periodKey.startsWith('week-') &&
+          s.periodKey.slice(5, 12) === monthKey.slice(6, 13)
+        );
+        monthlyData.push(monthSnaps.reduce((sum, s) => sum + s.totalAU, 0));
+      }
+    } else {
+      monthlyData = history.map(h => h.au);
+    }
+
+    return {
+      label: ch.name,
+      data: monthlyData,
+      borderColor: CHART_COLORS[i % CHART_COLORS.length],
+      backgroundColor: 'transparent',
+      borderWidth: ch.priority === 1 ? 3 : 1.5,
+      pointRadius: ch.priority === 1 ? 4 : 2,
+      tension: 0.3
+    };
+  });
+
+  bottomChart = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: { font: { size: 11 }, boxWidth: 20, padding: 10,
+            generateLabels: (chart) => chart.data.datasets.map((ds, i) => ({
+              text: ds.label,
+              fillStyle: ds.borderColor,
+              strokeStyle: ds.borderColor,
+              lineWidth: ds.borderWidth,
+              fontStyle: CHANNELS[i].priority === 1 ? 'bold' : 'normal',
+              hidden: false, index: i, datasetIndex: i
+            }))
+          }
+        }
+      },
+      scales: {
+        x: { grid: { color: 'rgba(0,0,0,0.04)' } },
+        y: { grid: { color: 'rgba(0,0,0,0.04)' }, ticks: { callback: v => v + ' AU' } }
+      }
+    }
+  });
+}
+
+// ── Log panel ─────────────────────────────────────────────────────────────
+function openLog(channelId) {
+  selectedChannel = channelId;
+  const ch = CHANNELS.find(c => c.id === channelId);
+  document.getElementById('log-title').textContent = 'Log attention → ' + ch.name;
+  activeTags = new Set();
+  document.querySelectorAll('.tag-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('enjoy-box').checked = false;
+  document.getElementById('enjoy-label').classList.remove('checked');
+  document.getElementById('log-notes').value = '';
+  document.getElementById('log-min').value = 30;
+  document.getElementById('log-int').value = 5;
+  document.getElementById('int-display').textContent = '5/10';
+  updateAUPreview();
+  openPanel('log-panel');
+}
+
+function openPanel(id) {
+  ['log-panel','manage-panel','settings-panel'].forEach(p =>
+    document.getElementById(p).classList.toggle('open', p === id));
+  renderMixer();
+}
+
+function togglePanel(id) {
+  const el = document.getElementById(id);
+  const wasOpen = el.classList.contains('open');
+  closeAll();
+  if (!wasOpen) el.classList.add('open');
+}
+
+function closeAll() {
+  selectedChannel = null;
+  ['log-panel','manage-panel','settings-panel'].forEach(p =>
+    document.getElementById(p).classList.remove('open'));
+  render();
+}
+
+function updateAUPreview() {
+  const min = parseInt(document.getElementById('log-min').value) || 30;
+  const intensity = parseInt(document.getElementById('log-int').value) || 5;
+  const au = auScore(min, intensity);
+  document.getElementById('au-preview').textContent = au.toFixed(2) + ' AU';
+  const ctx = au >= AU_CEIL ? '— overflow!'
+    : au >= 75 ? '— upper third'
+    : au >= 50 ? '— past halfway'
+    : au >= 25 ? '— past first tick'
+    : '— below first tick';
+  document.getElementById('au-context').textContent = ctx;
+}
+
+function toggleTag(el, tag) {
+  if (activeTags.has(tag)) { activeTags.delete(tag); el.classList.remove('active'); }
+  else { activeTags.add(tag); el.classList.add('active'); }
+}
+
+function toggleEnjoy() {
+  const cb = document.getElementById('enjoy-box');
+  cb.checked = !cb.checked;
+  document.getElementById('enjoy-label').classList.toggle('checked', cb.checked);
+}
+
+function setFilter(el, f) {
+  logFilter = f;
+  document.querySelectorAll('.log-filter-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  renderLog();
+}
+
+async function submitEntry() {
+  const min = parseInt(document.getElementById('log-min').value) || 30;
+  const intensity = parseInt(document.getElementById('log-int').value) || 5;
+  const notes = document.getElementById('log-notes').value.trim();
+  const enjoyed = document.getElementById('enjoy-box').checked;
+  const au = auScore(min, intensity);
+  const ch = CHANNELS.find(c => c.id === selectedChannel);
+
+  const entry = {
+    channelId: selectedChannel,
+    channelName: ch.name,
+    cadence: ch.cadence,
+    minutes: min, intensity, tags: Array.from(activeTags),
+    enjoyed, notes, au, ts: Date.now(), ssStatus: null
+  };
+
+  showToast('Saving…');
+  const saved = await saveEntry(entry);
+  if (saved) {
+    entries.unshift(entry);
+    entry.ssStatus = 'pending';
+    closeAll();
+    await postEntryToSmartsheet(entry, ch);
+    entry.ssStatus = 'ok';
+    showToast('Saved ✓', 'ok');
+    await checkAndCreateSnapshots();
+    render();
+  } else {
+    showToast('Save failed — check Firebase', 'err');
+  }
+}
+
+function renderLog() {
+  const ll = document.getElementById('log-list');
+  if (!entries.length) {
+    ll.innerHTML = '<div class="empty-log">No entries yet. Click any channel to log attention.</div>';
+    return;
+  }
+  const { start, end } = weekBounds(weekOffset);
+  let filtered = [...entries].sort((a, b) => b.ts - a.ts);
+  if (logFilter === 'this-week') filtered = filtered.filter(e => e.ts >= start.getTime() && e.ts <= end.getTime());
+  else if (logFilter === 'obstacle') filtered = filtered.filter(e => e.tags && e.tags.includes('obstacle'));
+  else if (logFilter === 'enjoyed') filtered = filtered.filter(e => e.enjoyed);
+  if (!filtered.length) { ll.innerHTML = '<div class="empty-log">No entries match this filter.</div>'; return; }
+  ll.innerHTML = filtered.slice(0, 50).map(e => {
+    const ch = CHANNELS.find(x => x.id === e.channelId);
+    const d = new Date(e.ts);
+    const ds = d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) + ' at ' + d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' });
+    const tagPills = (e.tags || []).map(t => `<span class="tag-pill">${t}</span>`).join('');
+    const enjoyPill = e.enjoyed ? '<span class="enjoy-pill"><i class="ti ti-heart"></i> enjoyed</span>' : '';
+    return `<div class="entry">
+      <div class="entry-au">${e.au.toFixed(2)}</div>
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+          <span class="entry-proj">${ch ? ch.name : e.channelName || '—'}</span>
+          <span class="entry-date">${ds}</span>
+        </div>
+        <div class="entry-meta">${e.minutes}min · ${e.intensity}/10 ${tagPills} ${enjoyPill}</div>
+        ${e.notes ? `<div class="entry-notes">${e.notes}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function exportCSV() {
+  const rows = [['Channel','Cadence','Date','Time','Minutes','Intensity','AU','Tags','Enjoyed','Notes']];
+  for (const e of [...entries].sort((a, b) => b.ts - a.ts)) {
+    const d = new Date(e.ts);
+    rows.push([e.channelName, e.cadence, d.toLocaleDateString(), d.toLocaleTimeString(),
+      e.minutes, e.intensity, e.au.toFixed(2), (e.tags||[]).join(';'),
+      e.enjoyed?'Yes':'No', e.notes]);
+  }
+  const csv = rows.map(r => r.map(c => `"${String(c||'').replace(/"/g,'""')}"`).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv,' + encodeURIComponent(csv);
+  a.download = 'attention-log.csv';
+  a.click();
+}
+
+function shiftWeek(dir) {
+  if (dir > 0 && weekOffset >= 0) return;
+  weekOffset += dir;
+  render();
+}
+
+// Expose to window
+window.shiftWeek = shiftWeek;
+window.togglePanel = togglePanel;
+window.closeAll = closeAll;
+window.toggleTag = toggleTag;
+window.toggleEnjoy = toggleEnjoy;
+window.updateAUPreview = updateAUPreview;
+window.submitEntry = submitEntry;
+window.setFilter = setFilter;
+window.exportCSV = exportCSV;
+window.toggleBottomChart = toggleBottomChart;
+
+// Init
+loadFromFirebase().then(() => checkAndCreateSnapshots());
+</script>
 <style>
   :root {
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -12,16 +754,15 @@
     --color-text-secondary: #6b6b6b;
     --color-background-primary: #ffffff;
     --color-background-secondary: #f5f5f3;
-    --color-border-primary: #a0a0a0;
     --color-border-secondary: #d0d0cc;
     --color-border-tertiary: #e8e8e4;
     --border-radius-md: 6px;
     --border-radius-lg: 10px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: var(--font-sans); background: #f5f5f3; color: var(--color-text-primary); min-height: 100vh; }
-  .app-wrap { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
-  .app-title { font-size: 20px; font-weight: 600; color: var(--color-text-primary); margin-bottom: 1.5rem; display: flex; align-items: center; gap: 10px; }
+  body { font-family: var(--font-sans); background: #f0f0ee; color: var(--color-text-primary); min-height: 100vh; }
+  .app-wrap { max-width: 1200px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  .app-title { font-size: 20px; font-weight: 600; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 10px; }
   .app-title span { font-size: 13px; font-weight: 400; color: var(--color-text-secondary); }
   input, select, textarea { font-family: var(--font-sans); color: var(--color-text-primary); background: var(--color-background-secondary); border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 7px 10px; font-size: 13px; width: 100%; outline: none; }
   input:focus, select:focus, textarea:focus { border-color: #378ADD; }
@@ -29,40 +770,41 @@
   .week-nav { display: flex; align-items: center; gap: 8px; }
   .week-nav button { background: var(--color-background-primary); border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 6px 12px; font-size: 13px; color: var(--color-text-secondary); cursor: pointer; font-family: var(--font-sans); }
   .week-nav button:hover { background: var(--color-background-secondary); }
-  .week-label { font-size: 14px; font-weight: 500; color: var(--color-text-primary); min-width: 170px; text-align: center; }
+  .week-label { font-size: 14px; font-weight: 500; min-width: 170px; text-align: center; }
   .top-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .summary-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 9px; margin-bottom: 1.25rem; }
-  @media (max-width: 700px) { .summary-row { grid-template-columns: repeat(3, 1fr); } }
+  .summary-row { display: grid; grid-template-columns: repeat(5,1fr); gap: 9px; margin-bottom: 1.25rem; }
   .metric { background: var(--color-background-primary); border-radius: var(--border-radius-md); padding: 10px 12px; border: 0.5px solid var(--color-border-tertiary); }
   .metric-label { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 3px; }
-  .metric-value { font-size: 20px; font-weight: 500; color: var(--color-text-primary); }
-  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 1rem; align-items: center; }
-  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--color-text-secondary); }
-  .legend-swatch { width: 10px; height: 10px; border-radius: 3px; }
-  .legend-note { margin-left: auto; font-size: 10px; color: var(--color-text-secondary); }
-  .mixer { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; margin-bottom: 1.25rem; }
-  .channel { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 9px 6px 7px; display: flex; flex-direction: column; align-items: center; gap: 5px; cursor: pointer; transition: border-color .15s, box-shadow .15s; position: relative; }
-  .channel:hover { border-color: var(--color-border-primary); box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+  .metric-value { font-size: 20px; font-weight: 500; }
+  .mixer-section { margin-bottom: 1.5rem; }
+  .section-label { font-size: 11px; font-weight: 600; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; padding-left: 2px; }
+  .channel-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+  .channel { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 9px 6px 7px; display: flex; flex-direction: column; align-items: center; gap: 5px; cursor: pointer; transition: border-color .15s, box-shadow .15s; position: relative; min-width: 76px; }
+  .channel:hover { border-color: #378ADD; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
   .channel.selected { border: 1.5px solid #378ADD; }
+  .channel.priority { min-width: 100px; border-color: #c8c8c4; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
   .ch-name { font-size: 10px; font-weight: 500; color: var(--color-text-secondary); text-align: center; line-height: 1.3; width: 100%; word-break: break-word; min-height: 28px; display: flex; align-items: center; justify-content: center; }
-  .fader-outer { position: relative; width: 36px; height: 120px; }
-  .fader-wrap { width: 24px; height: 120px; background: var(--color-background-secondary); border-radius: 12px; position: absolute; left: 50%; transform: translateX(-50%); display: flex; align-items: flex-end; overflow: hidden; border: 0.5px solid var(--color-border-tertiary); }
-  .fader-fill { width: 100%; border-radius: 12px; transition: height .5s cubic-bezier(.34, 1.2, .64, 1); }
+  .channel.priority .ch-name { font-size: 11px; font-weight: 600; min-height: 32px; color: var(--color-text-primary); }
+  .fader-outer { position: relative; width: 36px; }
+  .fader-wrap { width: 24px; background: var(--color-background-secondary); border-radius: 12px; position: absolute; left: 50%; transform: translateX(-50%); display: flex; align-items: flex-end; overflow: hidden; border: 0.5px solid var(--color-border-tertiary); }
+  .fader-fill { width: 100%; border-radius: 12px; transition: height .5s cubic-bezier(.34,1.2,.64,1); }
   .tick { position: absolute; left: 0; right: 0; display: flex; align-items: center; pointer-events: none; }
-  .tick-line { flex: 1; border-top: 1px dashed rgba(128,128,128,0.35); }
-  .tick-val { font-size: 7px; color: var(--color-text-secondary); margin-left: 2px; white-space: nowrap; line-height: 1; }
-  .vol-label { font-size: 11px; font-weight: 500; color: var(--color-text-primary); }
+  .tick-line { flex: 1; border-top: 1px dashed rgba(128,128,128,0.3); }
+  .tick-val { font-size: 7px; color: var(--color-text-secondary); margin-left: 2px; white-space: nowrap; }
+  .goal-line { position: absolute; left: -4px; right: -4px; border-top: 1.5px solid rgba(186,117,23,0.6); pointer-events: none; }
+  .vol-label { font-size: 11px; font-weight: 500; }
+  .goal-label { font-size: 9px; color: var(--color-text-secondary); }
   .alert-dot { width: 6px; height: 6px; border-radius: 50%; background: #E24B4A; position: absolute; top: 6px; right: 6px; }
   .overflow-dot { width: 6px; height: 6px; border-radius: 50%; background: #BA7517; position: absolute; top: 6px; left: 6px; }
-  .cadence-badge { font-size: 10px; padding: 2px 5px; border-radius: var(--border-radius-md); font-weight: 500; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cadence-daily { background: #E1F5EE; color: #085041; }
+  .risk-dot { width: 6px; height: 6px; border-radius: 50%; background: #E89C2D; position: absolute; top: 6px; right: 6px; }
+  .cadence-badge { font-size: 9px; padding: 2px 5px; border-radius: var(--border-radius-md); font-weight: 500; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cadence-weekly { background: #E6F1FB; color: #0C447C; }
-  .cadence-monthly { background: #F0EEFA; color: #3B2D8A; }
+  .cadence-monthly { background: #E1F5EE; color: #085041; }
   .zero-warn { font-size: 9px; color: #A32D2D; text-align: center; font-weight: 500; }
   .overflow-warn { font-size: 9px; color: #633806; text-align: center; font-weight: 500; }
   .panel { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 1.25rem; margin-bottom: 1.25rem; display: none; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
   .panel.open { display: block; }
-  .panel h3 { font-size: 14px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 12px; }
+  .panel h3 { font-size: 14px; font-weight: 500; margin-bottom: 12px; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
   .field label { display: block; font-size: 12px; color: var(--color-text-secondary); margin-bottom: 4px; }
   .field textarea { resize: vertical; min-height: 56px; }
@@ -71,18 +813,15 @@
   .btn-p:hover { background: #185FA5; }
   .btn-s { background: transparent; color: var(--color-text-secondary); border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 7px 14px; font-size: 13px; cursor: pointer; font-family: var(--font-sans); }
   .btn-s:hover { background: var(--color-background-secondary); }
-  .btn-danger { background: transparent; color: #A32D2D; border: 0.5px solid #F7C1C1; border-radius: var(--border-radius-md); padding: 7px 14px; font-size: 13px; cursor: pointer; font-family: var(--font-sans); }
-  .btn-danger:hover { background: #FCEBEB; }
   .tag-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-  .tag-btn { font-size: 11px; padding: 4px 10px; border-radius: 20px; border: 0.5px solid var(--color-border-secondary); background: transparent; color: var(--color-text-secondary); cursor: pointer; font-family: var(--font-sans); display: flex; align-items: center; gap: 4px; }
+  .tag-btn { font-size: 11px; padding: 4px 10px; border-radius: 20px; border: 0.5px solid var(--color-border-secondary); background: transparent; color: var(--color-text-secondary); cursor: pointer; font-family: var(--font-sans); }
   .tag-btn.active { border-color: #185FA5; color: #185FA5; background: #E6F1FB; }
-  .enjoy-check { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--border-radius-md); border: 0.5px solid var(--color-border-secondary); cursor: pointer; font-size: 13px; color: var(--color-text-primary); margin-bottom: 12px; background: var(--color-background-secondary); user-select: none; }
-  .enjoy-check input { cursor: pointer; width: 15px; height: 15px; flex-shrink: 0; }
+  .enjoy-check { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--border-radius-md); border: 0.5px solid var(--color-border-secondary); cursor: pointer; font-size: 13px; margin-bottom: 12px; background: var(--color-background-secondary); user-select: none; }
   .enjoy-check.checked { border-color: #0F6E56; background: #E1F5EE; color: #085041; }
+  .au-preview-box { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 12px; padding: 8px 10px; background: var(--color-background-secondary); border-radius: var(--border-radius-md); }
   .slider-row { display: flex; align-items: center; gap: 8px; }
   .slider-row input[type=range] { flex: 1; padding: 0; border: none; background: transparent; }
-  .au-preview-box { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 12px; padding: 8px 10px; background: var(--color-background-secondary); border-radius: var(--border-radius-md); }
-  .log-section { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 1.25rem; }
+  .log-section { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 1.25rem; margin-bottom: 1.25rem; }
   .log-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
   .log-header h3 { font-size: 14px; font-weight: 500; }
   .log-filters { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -90,36 +829,32 @@
   .log-filter-btn.active { background: var(--color-background-secondary); color: var(--color-text-primary); font-weight: 500; }
   .entry { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; border-bottom: 0.5px solid var(--color-border-tertiary); }
   .entry:last-child { border-bottom: none; }
-  .entry-au { font-weight: 500; color: var(--color-text-primary); min-width: 42px; font-size: 13px; }
+  .entry-au { font-weight: 500; min-width: 42px; font-size: 13px; }
   .entry-proj { color: #185FA5; font-weight: 500; font-size: 13px; }
   .entry-meta { color: var(--color-text-secondary); font-size: 12px; margin-top: 2px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-  .entry-notes { color: var(--color-text-primary); font-size: 12px; margin-top: 3px; font-style: italic; }
+  .entry-notes { font-size: 12px; margin-top: 3px; font-style: italic; }
   .entry-date { color: var(--color-text-secondary); font-size: 11px; white-space: nowrap; }
   .tag-pill { font-size: 10px; padding: 2px 6px; border-radius: 10px; background: var(--color-background-secondary); color: var(--color-text-secondary); border: 0.5px solid var(--color-border-tertiary); }
   .enjoy-pill { font-size: 10px; padding: 2px 6px; border-radius: 10px; background: #E1F5EE; color: #085041; border: 0.5px solid #9FE1CB; }
-  .ss-badge { font-size: 10px; padding: 2px 6px; border-radius: var(--border-radius-md); border: 0.5px solid; }
-  .ss-ok { background: #E1F5EE; color: #085041; border-color: #9FE1CB; }
-  .ss-fail { background: #FCEBEB; color: #A32D2D; border-color: #F7C1C1; }
-  .ss-pending { background: #FAEEDA; color: #633806; border-color: #FAC775; }
-  .ss-status-bar { font-size: 12px; padding: 8px 12px; border-radius: var(--border-radius-md); margin-top: 10px; }
-  .ss-ok-bar { background: #E1F5EE; color: #085041; }
-  .ss-fail-bar { background: #FCEBEB; color: #A32D2D; }
   .empty-log { font-size: 13px; color: var(--color-text-secondary); padding: 8px 0; }
-  .manage-row { display: grid; grid-template-columns: 2fr 1fr 1.2fr auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 0.5px solid var(--color-border-tertiary); }
-  .manage-row:last-child { border-bottom: none; }
-  .new-proj-row { display: grid; grid-template-columns: 2fr 1fr 1.2fr auto; gap: 8px; align-items: end; margin-top: 12px; }
-  .section-sep { border: none; border-top: 0.5px solid var(--color-border-tertiary); margin: 12px 0; }
   .hint { font-size: 11px; color: var(--color-text-secondary); margin-top: 2px; }
-  .manage-header { display: grid; grid-template-columns: 2fr 1fr 1.2fr auto; gap: 8px; margin-bottom: 6px; }
+  .bottom-chart-section { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 1.25rem; margin-bottom: 1.25rem; }
+  .bottom-chart-section h3 { font-size: 14px; font-weight: 500; margin-bottom: 12px; }
+  #sparkline-popup { position: absolute; z-index: 1000; background: #fff; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-lg); padding: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.12); display: none; pointer-events: none; }
+  .spark-title { font-size: 11px; font-weight: 500; margin-bottom: 8px; color: var(--color-text-primary); }
+  .toast { position: fixed; bottom: 24px; right: 24px; background: #1a1a1a; color: #fff; font-size: 13px; padding: 9px 16px; border-radius: var(--border-radius-md); opacity: 0; transform: translateY(8px); transition: all .2s; pointer-events: none; z-index: 9999; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.ok { background: #085041; }
+  .toast.err { background: #A32D2D; }
+  .legend-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 1rem; align-items: center; font-size: 11px; color: var(--color-text-secondary); }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 3px; }
+  .goal-line-legend { width: 20px; border-top: 1.5px solid rgba(186,117,23,0.6); }
 </style>
 </head>
 <body>
 <div class="app-wrap">
-
-  <div class="app-title">
-    🎚️ Attention Mixer
-    <span>weekly project focus tracker</span>
-  </div>
+  <div class="app-title">🎚️ Attention Mixer <span>weekly project focus tracker</span></div>
 
   <div class="top-bar">
     <div class="week-nav">
@@ -128,24 +863,25 @@
       <button onclick="shiftWeek(1)" id="next-btn"><i class="ti ti-chevron-right"></i></button>
     </div>
     <div class="top-actions">
-      <button class="btn-s" onclick="togglePanel('manage-panel')"><i class="ti ti-adjustments-horizontal"></i> Channels</button>
-      <button class="btn-s" onclick="togglePanel('settings-panel')"><i class="ti ti-settings"></i> Smartsheet</button>
+      <button class="btn-s" id="chart-toggle-btn" onclick="toggleBottomChart()"><i class="ti ti-chart-line"></i> Show trends</button>
       <button class="btn-s" onclick="exportCSV()"><i class="ti ti-download"></i> Export CSV</button>
     </div>
   </div>
 
   <div class="summary-row" id="summary-row"></div>
 
-  <div class="legend">
+  <div class="legend-row">
+    <div class="legend-item"><div class="legend-swatch" style="background:#185FA5;"></div> Weekly priority</div>
     <div class="legend-item"><div class="legend-swatch" style="background:#378ADD;"></div> Weekly</div>
-    <div class="legend-item"><div class="legend-swatch" style="background:#1D9E75;"></div> Daily</div>
-    <div class="legend-item"><div class="legend-swatch" style="background:#534AB7;"></div> Monthly</div>
-    <div class="legend-item"><div class="legend-swatch" style="background:#BA7517;"></div> Overflow (&gt;100 AU)</div>
-    <div class="legend-item"><div class="legend-swatch" style="background:#E24B4A;border-radius:50%;"></div> No attention</div>
-    <div class="legend-note">Ticks: 25 · 50 · 75 AU &nbsp;|&nbsp; Overflow &gt; 100 AU</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#085041;"></div> Monthly priority</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#1D9E75;"></div> Monthly</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#BA7517;"></div> Overflow</div>
+    <div class="legend-item"><div class="goal-line-legend"></div> Weekly goal</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#E24B4A;border-radius:50%;"></div> Needs attn</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#E89C2D;border-radius:50%;"></div> At risk</div>
   </div>
 
-  <div class="mixer" id="mixer"></div>
+  <div id="mixer"></div>
 
   <!-- LOG PANEL -->
   <div class="panel" id="log-panel">
@@ -163,87 +899,41 @@
       </div>
     </div>
     <div class="field" style="margin-bottom:8px;">
-      <label style="margin-bottom:6px;display:block;">Tags &nbsp;<span style="color:var(--color-text-secondary);font-size:11px;">(select all that apply)</span></label>
+      <label style="margin-bottom:6px;display:block;">Tags &nbsp;<span style="font-size:11px;color:var(--color-text-secondary);">(select all that apply)</span></label>
       <div class="tag-wrap">
-        <button class="tag-btn" onclick="toggleTag(this,'progress')" title="I moved this project forward"><i class="ti ti-arrow-up-right"></i> Progress</button>
-        <button class="tag-btn" onclick="toggleTag(this,'planning')" title="Thinking, organizing, strategizing"><i class="ti ti-map"></i> Planning</button>
-        <button class="tag-btn" onclick="toggleTag(this,'review')" title="Checking on status, not creating"><i class="ti ti-eye"></i> Review</button>
-        <button class="tag-btn" onclick="toggleTag(this,'obstacle')" title="Something is blocking progress"><i class="ti ti-barrier-block"></i> Obstacle</button>
-        <button class="tag-btn" onclick="toggleTag(this,'admin')" title="Necessary overhead, not advancing the work"><i class="ti ti-briefcase"></i> Admin</button>
+        <button class="tag-btn" onclick="toggleTag(this,'progress')"><i class="ti ti-arrow-up-right"></i> Progress</button>
+        <button class="tag-btn" onclick="toggleTag(this,'planning')"><i class="ti ti-map"></i> Planning</button>
+        <button class="tag-btn" onclick="toggleTag(this,'review')"><i class="ti ti-eye"></i> Review</button>
+        <button class="tag-btn" onclick="toggleTag(this,'obstacle')"><i class="ti ti-barrier-block"></i> Obstacle</button>
+        <button class="tag-btn" onclick="toggleTag(this,'admin')"><i class="ti ti-briefcase"></i> Admin</button>
       </div>
     </div>
     <label id="enjoy-label" class="enjoy-check" onclick="toggleEnjoy()">
-      <input type="checkbox" id="enjoy-box" onclick="event.stopPropagation();updateEnjoyStyle()">
+      <input type="checkbox" id="enjoy-box" onclick="event.stopPropagation();document.getElementById('enjoy-label').classList.toggle('checked',this.checked)">
       <i class="ti ti-heart" style="font-size:15px;"></i>
       <span>I enjoyed this work</span>
-      <span style="font-size:11px;opacity:0.7;margin-left:4px;">— tracks which parts of your job feel fulfilling</span>
     </label>
     <div class="field" style="margin-bottom:10px;">
       <label>Notes (optional)</label>
       <textarea id="log-notes" placeholder="What happened? Any blockers? What moved forward?"></textarea>
     </div>
     <div class="au-preview-box">
-      Formula: (minutes ÷ 30) × (intensity ÷ 10) × 5 &nbsp;→&nbsp;
-      <span id="au-preview" style="font-weight:500;color:var(--color-text-primary);font-size:13px;"></span>
-      <span id="au-context" style="color:var(--color-text-secondary);margin-left:6px;"></span>
+      (minutes ÷ 30) × (intensity ÷ 10) × 5 → <span id="au-preview" style="font-weight:500;font-size:13px;color:var(--color-text-primary);"></span>
+      <span id="au-context" style="margin-left:6px;"></span>
     </div>
     <div class="btn-row">
       <button class="btn-s" onclick="closeAll()">Cancel</button>
-      <button class="btn-p" onclick="saveEntry()">Save entry</button>
+      <button class="btn-p" onclick="submitEntry()">Save</button>
     </div>
   </div>
 
-  <!-- MANAGE CHANNELS PANEL -->
-  <div class="panel" id="manage-panel">
-    <h3>Manage channels</h3>
-    <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:12px;">Edit name, cadence, or badge label inline. Changes apply immediately.</p>
-    <div class="manage-header">
-      <span style="font-size:11px;color:var(--color-text-secondary);">Name</span>
-      <span style="font-size:11px;color:var(--color-text-secondary);">Cadence</span>
-      <span style="font-size:11px;color:var(--color-text-secondary);">Badge label</span>
-      <span></span>
-    </div>
-    <div id="manage-list"></div>
-    <hr class="section-sep">
-    <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;font-weight:500;">Add a channel</p>
-    <div class="new-proj-row">
-      <div class="field"><label>Name</label><input type="text" id="new-name" placeholder="Project name"></div>
-      <div class="field"><label>Cadence</label>
-        <select id="new-cadence">
-          <option value="daily">Daily</option>
-          <option value="weekly" selected>Weekly</option>
-          <option value="monthly">Monthly</option>
-        </select>
-      </div>
-      <div class="field"><label>Badge label</label><input type="text" id="new-label" placeholder="e.g. Wkly" maxlength="7"></div>
-      <div class="field"><label style="visibility:hidden;">x</label><button class="btn-p" onclick="addProject()"><i class="ti ti-plus"></i> Add</button></div>
-    </div>
-    <div class="btn-row" style="margin-top:14px;"><button class="btn-s" onclick="closeAll()">Done</button></div>
+  <!-- BOTTOM CHART -->
+  <div class="bottom-chart-section" id="bottom-chart-section" style="display:none;">
+    <h3>AU trends — last 6 months</h3>
+    <canvas id="bottom-chart-canvas" height="350"></canvas>
   </div>
 
-  <!-- SMARTSHEET PANEL -->
-  <div class="panel" id="settings-panel">
-    <h3>Smartsheet connection via Make.com</h3>
-    <p style="font-size:13px;color:var(--color-text-secondary);margin-bottom:14px;line-height:1.6;">
-      Each saved entry posts to your Make.com webhook, which forwards it to Smartsheet automatically.<br>
-      Your webhook URL is stored in your browser's localStorage.
-    </p>
-    <div style="display:grid;gap:12px;margin-bottom:10px;">
-      <div class="field">
-        <label>Make.com webhook URL</label>
-        <div class="hint" style="margin-bottom:6px;">From your Make scenario → Custom webhook module → copy the webhook URL</div>
-        <input type="text" id="ss-webhook" placeholder="https://hook.us2.make.com/...">
-      </div>
-    </div>
-    <div id="ss-status-bar" style="display:none;" class="ss-status-bar"></div>
-    <div class="btn-row" style="margin-top:12px;">
-      <button class="btn-s" onclick="closeAll()">Cancel</button>
-      <button class="btn-s" onclick="testSS()"><i class="ti ti-plug"></i> Test connection</button>
-      <button class="btn-p" onclick="saveSS()">Save</button>
-    </div>
-  </div>
-
-  <!-- ATTENTION LOG -->
+  <!-- LOG -->
   <div class="log-section">
     <div class="log-header">
       <h3>Attention log</h3>
@@ -256,429 +946,14 @@
     </div>
     <div id="log-list"></div>
   </div>
-
 </div>
 
-<script>
-const AU_CEIL = 100;
-const FADER_H = 120;
-const TICK_AU = [25, 50, 75];
+<!-- Sparkline popup -->
+<div id="sparkline-popup">
+  <div class="spark-title"></div>
+  <canvas id="sparkline-canvas" width="260" height="140"></canvas>
+</div>
 
-const COLORS = {
-  daily:   { normal: '#1D9E75', low: '#5DCAA5', overflow: '#BA7517' },
-  weekly:  { normal: '#378ADD', low: '#85B7EB', overflow: '#BA7517' },
-  monthly: { normal: '#534AB7', low: '#AFA9EC', overflow: '#BA7517' }
-};
-
-function auToFaderPct(au) {
-  if (au <= 0) return 0;
-  return Math.sqrt(Math.min(au, AU_CEIL) / AU_CEIL);
-}
-
-function auScore(min, intensity) {
-  return Math.round((min / 30) * (intensity / 10) * 5 * 100) / 100;
-}
-
-// ── State ──────────────────────────────────────────────────────────────────
-let projects = [
-  { id:1,  name:'Website',                  cadence:'weekly',  label:'Web'     },
-  { id:2,  name:'Kiosk',                    cadence:'weekly',  label:'Kiosk'   },
-  { id:3,  name:'CPC',                      cadence:'daily',   label:'CPC'     },
-  { id:4,  name:'Billing',                  cadence:'weekly',  label:'Bill'    },
-  { id:5,  name:'Accounting',               cadence:'monthly', label:'Acct'    },
-  { id:6,  name:'Smartsheet Repairs',       cadence:'weekly',  label:'SS Rep'  },
-  { id:7,  name:'Smartsheet Project Mgmt',  cadence:'weekly',  label:'SS PM'   },
-  { id:8,  name:'Smartsheet Dashboards',    cadence:'weekly',  label:'SS Dash' },
-  { id:9,  name:'IMSERC Committee',         cadence:'monthly', label:'IMSERC'  },
-  { id:10, name:'New Process Improvements', cadence:'monthly', label:'NPI'     },
-  { id:11, name:'Daily Support Tickets',    cadence:'daily',   label:'Tickets' },
-  { id:12, name:'Intake/Onboarding',        cadence:'weekly',  label:'Intake'  },
-  { id:13, name:'Ext Account & Agrmt Mgmt', cadence:'monthly', label:'ExtAcct' },
-  { id:14, name:'Course Infrastructure',    cadence:'monthly', label:'CrsInfr' },
-  { id:15, name:'Marketing',                cadence:'monthly', label:'Mktg'    },
-  { id:16, name:'Workshops/Education',      cadence:'monthly', label:'Wkshp'   }
-];
-let entries = [];
-let selectedProject = null;
-let activeTags = new Set();
-let logFilter = 'all';
-let nextId = 17;
-let weekOffset = 0;
-let ssWebhook = 'https://hook.us2.make.com/88giht9207eu9ai1a4dflw6i3lmpqigi';
-
-// ── Persistence (localStorage) ────────────────────────────────────────────
-function saveToStorage() {
-  try {
-    localStorage.setItem('am_projects', JSON.stringify(projects));
-    localStorage.setItem('am_entries', JSON.stringify(entries));
-    localStorage.setItem('am_nextId', String(nextId));
-  } catch(e) {}
-}
-
-function loadFromStorage() {
-  try {
-    const p = localStorage.getItem('am_projects');
-    const e = localStorage.getItem('am_entries');
-    const n = localStorage.getItem('am_nextId');
-    const w = localStorage.getItem('am_ss_webhook');
-    if (p) projects = JSON.parse(p);
-    if (e) entries = JSON.parse(e);
-    if (n) nextId = parseInt(n);
-    if (w) { ssWebhook = w; document.getElementById('ss-webhook').value = w; }
-    else { document.getElementById('ss-webhook').value = ssWebhook; }
-  } catch(e) {}
-}
-
-// ── Week helpers ──────────────────────────────────────────────────────────
-function weekBounds(offset) {
-  const now = new Date();
-  const day = now.getDay();
-  const monday = new Date(now);
-  monday.setDate(now.getDate() - ((day + 6) % 7) + offset * 7);
-  monday.setHours(0, 0, 0, 0);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  sunday.setHours(23, 59, 59, 999);
-  return { start: monday, end: sunday };
-}
-
-function weekLabel(offset) {
-  if (offset === 0) return 'This week';
-  if (offset === -1) return 'Last week';
-  const { start, end } = weekBounds(offset);
-  const fmt = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  return fmt(start) + ' – ' + fmt(end);
-}
-
-function projectAU(pid, offset) {
-  const { start, end } = weekBounds(offset);
-  return entries
-    .filter(e => e.pid === pid && e.ts >= start.getTime() && e.ts <= end.getTime())
-    .reduce((s, e) => s + e.au, 0);
-}
-
-// ── AU preview ────────────────────────────────────────────────────────────
-function updateAUPreview() {
-  const min = parseInt(document.getElementById('log-min').value) || 30;
-  const intensity = parseInt(document.getElementById('log-int').value) || 5;
-  const au = auScore(min, intensity);
-  document.getElementById('au-preview').textContent = au.toFixed(2) + ' AU';
-  const ctx = au >= AU_CEIL ? '— overflow! channel maxed'
-    : au >= 75 ? '— upper third'
-    : au >= 50 ? '— past halfway'
-    : au >= 25 ? '— past first tick'
-    : '— below first tick';
-  document.getElementById('au-context').textContent = ctx;
-}
-
-// ── Render ────────────────────────────────────────────────────────────────
-function renderWeekNav() {
-  document.getElementById('week-label').textContent = weekLabel(weekOffset);
-  const nb = document.getElementById('next-btn');
-  nb.style.opacity = weekOffset >= 0 ? '0.3' : '1';
-  nb.style.pointerEvents = weekOffset >= 0 ? 'none' : 'auto';
-}
-
-function renderSummary() {
-  const zc = projects.filter(p => projectAU(p.id, weekOffset) === 0).length;
-  const oc = projects.filter(p => projectAU(p.id, weekOffset) > AU_CEIL).length;
-  const { start, end } = weekBounds(weekOffset);
-  const wE = entries.filter(e => e.ts >= start.getTime() && e.ts <= end.getTime());
-  const total = wE.reduce((s, e) => s + e.au, 0);
-  const avgInt = wE.length ? (wE.reduce((s, e) => s + e.intensity, 0) / wE.length).toFixed(1) : '—';
-  const enjoyPct = wE.length ? Math.round((wE.filter(e => e.enjoyed).length / wE.length) * 100) + '%' : '—';
-  document.getElementById('summary-row').innerHTML = `
-    <div class="metric"><div class="metric-label">Channels</div><div class="metric-value">${projects.length}</div></div>
-    <div class="metric"><div class="metric-label">Needs attention</div><div class="metric-value" style="color:${zc > 0 ? '#A32D2D' : 'var(--color-text-primary)'}">${zc}</div></div>
-    <div class="metric"><div class="metric-label">Overflowing</div><div class="metric-value" style="color:${oc > 0 ? '#BA7517' : 'var(--color-text-primary)'}">${oc}</div></div>
-    <div class="metric"><div class="metric-label">Total AU</div><div class="metric-value">${total.toFixed(1)}</div></div>
-    <div class="metric"><div class="metric-label">Enjoyed</div><div class="metric-value" style="color:#0F6E56;">${enjoyPct}</div></div>`;
-}
-
-function renderMixer() {
-  const mx = document.getElementById('mixer');
-  const sorted = [...projects]
-    .map(p => ({ p, vol: projectAU(p.id, weekOffset) }))
-    .sort((a, b) => a.vol - b.vol);
-  mx.innerHTML = '';
-  for (const { p, vol } of sorted) {
-    const isOverflow = vol > AU_CEIL;
-    const isZero = vol === 0;
-    const c = COLORS[p.cadence];
-    const fillColor = isOverflow ? c.overflow : (vol < AU_CEIL * 0.15 ? c.low : c.normal);
-    const pct = auToFaderPct(vol);
-    const fillPx = Math.max(Math.round(pct * FADER_H), isZero ? 0 : 2);
-
-    const ticksHTML = TICK_AU.map(t => {
-      const tPct = auToFaderPct(t);
-      const bottomPx = Math.round(tPct * FADER_H);
-      return `<div class="tick" style="bottom:${bottomPx}px;left:0;right:0;">
-        <div class="tick-line"></div>
-        <div class="tick-val">${t}</div>
-      </div>`;
-    }).join('');
-
-    const ch = document.createElement('div');
-    ch.className = 'channel' + (selectedProject === p.id ? ' selected' : '');
-    ch.onclick = () => openLog(p.id);
-    ch.innerHTML = `
-      ${isZero ? '<div class="alert-dot" title="No attention this week"></div>' : ''}
-      ${isOverflow ? '<div class="overflow-dot" title="Overflow — above 100 AU"></div>' : ''}
-      <div class="ch-name">${p.name}</div>
-      <div class="fader-outer">
-        ${ticksHTML}
-        <div class="fader-wrap">
-          <div class="fader-fill" style="height:${fillPx}px;background:${fillColor};border-radius:12px;"></div>
-        </div>
-      </div>
-      <div class="vol-label" style="color:${isOverflow ? '#BA7517' : isZero ? '#A32D2D' : 'var(--color-text-primary)'};">${vol.toFixed(1)}</div>
-      <span class="cadence-badge cadence-${p.cadence}">${p.label || p.cadence}</span>
-      ${isZero ? '<div class="zero-warn">needs attn</div>' : ''}
-      ${isOverflow ? '<div class="overflow-warn">overflow</div>' : ''}`;
-    mx.appendChild(ch);
-  }
-}
-
-function renderManage() {
-  document.getElementById('manage-list').innerHTML = projects.map(p => `
-    <div class="manage-row">
-      <input type="text" value="${p.name.replace(/"/g,'&quot;')}" style="font-size:13px;" onchange="editProject(${p.id},'name',this.value)">
-      <select style="font-size:12px;" onchange="editProject(${p.id},'cadence',this.value)">
-        <option value="daily"${p.cadence==='daily'?' selected':''}>Daily</option>
-        <option value="weekly"${p.cadence==='weekly'?' selected':''}>Weekly</option>
-        <option value="monthly"${p.cadence==='monthly'?' selected':''}>Monthly</option>
-      </select>
-      <input type="text" value="${(p.label||'').replace(/"/g,'&quot;')}" maxlength="7" placeholder="Short label" style="font-size:12px;" onchange="editProject(${p.id},'label',this.value)">
-      <button class="btn-danger" style="padding:5px 10px;font-size:12px;" onclick="deleteProject(${p.id})"><i class="ti ti-trash"></i></button>
-    </div>`).join('');
-}
-
-function renderLog() {
-  const ll = document.getElementById('log-list');
-  if (!entries.length) { ll.innerHTML = '<div class="empty-log">No entries yet. Click any channel to log attention.</div>'; return; }
-  const { start, end } = weekBounds(weekOffset);
-  let filtered = [...entries].sort((a, b) => b.ts - a.ts);
-  if (logFilter === 'this-week') filtered = filtered.filter(e => e.ts >= start.getTime() && e.ts <= end.getTime());
-  else if (logFilter === 'obstacle') filtered = filtered.filter(e => e.tags && e.tags.includes('obstacle'));
-  else if (logFilter === 'enjoyed') filtered = filtered.filter(e => e.enjoyed);
-  if (!filtered.length) { ll.innerHTML = '<div class="empty-log">No entries match this filter.</div>'; return; }
-  ll.innerHTML = filtered.map(e => {
-    const p = projects.find(x => x.id === e.pid);
-    const d = new Date(e.ts);
-    const ds = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' at ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    const tagPills = (e.tags || []).map(t => `<span class="tag-pill">${t}</span>`).join('');
-    const enjoyPill = e.enjoyed ? '<span class="enjoy-pill"><i class="ti ti-heart"></i> enjoyed</span>' : '';
-    const ssBadge = e.ssStatus === 'ok' ? '<span class="ss-badge ss-ok">Smartsheet ✓</span>'
-      : e.ssStatus === 'fail' ? '<span class="ss-badge ss-fail">Smartsheet ✗</span>'
-      : e.ssStatus === 'pending' ? '<span class="ss-badge ss-pending">Sending…</span>' : '';
-    return `<div class="entry">
-      <div class="entry-au">${e.au.toFixed(2)}</div>
-      <div style="flex:1">
-        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
-          <span class="entry-proj">${p ? p.name : '—'}</span>
-          <span class="entry-date">${ds}</span>
-        </div>
-        <div class="entry-meta">${e.minutes}min · ${e.intensity}/10 ${tagPills} ${enjoyPill} ${ssBadge}</div>
-        ${e.notes ? `<div class="entry-notes">${e.notes}</div>` : ''}
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function render() { renderWeekNav(); renderSummary(); renderMixer(); renderLog(); }
-
-// ── Navigation ────────────────────────────────────────────────────────────
-function shiftWeek(dir) {
-  if (dir > 0 && weekOffset >= 0) return;
-  weekOffset += dir;
-  render();
-}
-
-// ── Log panel ─────────────────────────────────────────────────────────────
-function openLog(pid) {
-  selectedProject = pid;
-  const p = projects.find(x => x.id === pid);
-  document.getElementById('log-title').textContent = 'Log attention → ' + p.name;
-  activeTags = new Set();
-  document.querySelectorAll('.tag-btn').forEach(b => b.classList.remove('active'));
-  document.getElementById('enjoy-box').checked = false;
-  document.getElementById('enjoy-label').classList.remove('checked');
-  document.getElementById('log-notes').value = '';
-  document.getElementById('log-min').value = 30;
-  document.getElementById('log-int').value = 5;
-  document.getElementById('int-display').textContent = '5/10';
-  updateAUPreview();
-  openPanel('log-panel');
-}
-
-function openPanel(id) {
-  ['log-panel', 'manage-panel', 'settings-panel'].forEach(p =>
-    document.getElementById(p).classList.toggle('open', p === id));
-  if (id === 'manage-panel') renderManage();
-  render();
-}
-
-function togglePanel(id) {
-  const el = document.getElementById(id);
-  const wasOpen = el.classList.contains('open');
-  closeAll();
-  if (!wasOpen) { el.classList.add('open'); if (id === 'manage-panel') renderManage(); }
-}
-
-function closeAll() {
-  selectedProject = null;
-  ['log-panel', 'manage-panel', 'settings-panel'].forEach(p =>
-    document.getElementById(p).classList.remove('open'));
-  render();
-}
-
-// ── Tags & enjoy ──────────────────────────────────────────────────────────
-function toggleTag(el, tag) {
-  if (activeTags.has(tag)) { activeTags.delete(tag); el.classList.remove('active'); }
-  else { activeTags.add(tag); el.classList.add('active'); }
-}
-
-function toggleEnjoy() {
-  const cb = document.getElementById('enjoy-box');
-  cb.checked = !cb.checked;
-  updateEnjoyStyle();
-}
-
-function updateEnjoyStyle() {
-  document.getElementById('enjoy-label').classList.toggle('checked', document.getElementById('enjoy-box').checked);
-}
-
-function setFilter(el, f) {
-  logFilter = f;
-  document.querySelectorAll('.log-filter-btn').forEach(b => b.classList.remove('active'));
-  el.classList.add('active');
-  renderLog();
-}
-
-// ── Save entry ────────────────────────────────────────────────────────────
-async function saveEntry() {
-  const min = parseInt(document.getElementById('log-min').value) || 30;
-  const intensity = parseInt(document.getElementById('log-int').value) || 5;
-  const notes = document.getElementById('log-notes').value.trim();
-  const enjoyed = document.getElementById('enjoy-box').checked;
-  const au = auScore(min, intensity);
-  const entry = { id: Date.now(), pid: selectedProject, minutes: min, intensity, tags: Array.from(activeTags), enjoyed, notes, au, ts: Date.now(), ssStatus: null };
-  entries.push(entry);
-  saveToStorage();
-  closeAll();
-  if (ssWebhook) {
-    entry.ssStatus = 'pending'; renderLog();
-    const ok = await postToSS(entry);
-    entry.ssStatus = ok ? 'ok' : 'fail';
-    saveToStorage();
-    renderLog();
-  }
-}
-
-// ── Smartsheet ────────────────────────────────────────────────────────────
-async function postToSS(entry) {
-  const p = projects.find(x => x.id === entry.pid);
-  const d = new Date(entry.ts);
-  const body = {
-    project:   p ? p.name : '',
-    cadence:   p ? p.cadence : '',
-    datetime:  d.toISOString(),
-    date:      d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-    time:      d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
-    minutes:   entry.minutes,
-    intensity: entry.intensity,
-    au:        entry.au,
-    tags:      (entry.tags || []).join(', '),
-    enjoyed:   entry.enjoyed ? 'Yes' : 'No',
-    notes:     entry.notes
-  };
-  try {
-    const r = await fetch(ssWebhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    return r.ok;
-  } catch(e) { return false; }
-}
-
-async function testSS() {
-  const webhook = document.getElementById('ss-webhook').value.trim();
-  const bar = document.getElementById('ss-status-bar');
-  bar.style.display = 'block'; bar.className = 'ss-status-bar'; bar.textContent = 'Sending test ping…';
-  try {
-    const r = await fetch(webhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ test: true, source: 'attention-mixer', datetime: new Date().toISOString() })
-    });
-    if (r.ok) {
-      bar.className = 'ss-status-bar ss-ok-bar';
-      bar.textContent = 'Webhook reached ✓ — check your Make scenario to confirm it received the ping, then finish mapping to Smartsheet.';
-    } else {
-      bar.className = 'ss-status-bar ss-fail-bar';
-      bar.textContent = 'Webhook returned an error (' + r.status + '). Double-check the URL.';
-    }
-  } catch(e) {
-    bar.className = 'ss-status-bar ss-fail-bar';
-    bar.textContent = 'Could not reach the webhook. Check the URL and that your Make scenario is active.';
-  }
-}
-
-function saveSS() {
-  ssWebhook = document.getElementById('ss-webhook').value.trim();
-  try { localStorage.setItem('am_ss_webhook', ssWebhook); } catch(e) {}
-  closeAll();
-}
-
-// ── Channel management ────────────────────────────────────────────────────
-function editProject(id, field, value) {
-  const p = projects.find(x => x.id === id);
-  if (p) p[field] = value.trim();
-  saveToStorage();
-  renderMixer(); renderSummary();
-}
-
-function deleteProject(id) {
-  if (!confirm('Delete this channel? Logged entries will be kept.')) return;
-  projects = projects.filter(x => x.id !== id);
-  saveToStorage();
-  renderManage(); renderMixer(); renderSummary();
-}
-
-function addProject() {
-  const name = document.getElementById('new-name').value.trim();
-  const cadence = document.getElementById('new-cadence').value;
-  const label = document.getElementById('new-label').value.trim() || cadence.slice(0, 4);
-  if (!name) return;
-  projects.push({ id: nextId++, name, cadence, label });
-  document.getElementById('new-name').value = '';
-  document.getElementById('new-label').value = '';
-  saveToStorage();
-  renderManage(); renderMixer(); renderSummary();
-}
-
-// ── Export ────────────────────────────────────────────────────────────────
-function exportCSV() {
-  const rows = [['Project','Cadence','Date','Time','Minutes','Intensity','AU','Tags','Enjoyed','Notes','Smartsheet']];
-  for (const e of [...entries].sort((a, b) => b.ts - a.ts)) {
-    const p = projects.find(x => x.id === e.pid);
-    const d = new Date(e.ts);
-    rows.push([p?p.name:'', p?p.cadence:'', d.toLocaleDateString(), d.toLocaleTimeString(),
-      e.minutes, e.intensity, e.au.toFixed(2), (e.tags||[]).join(';'),
-      e.enjoyed?'Yes':'No', e.notes, e.ssStatus||'not configured']);
-  }
-  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
-  const a = document.createElement('a');
-  a.href = 'data:text/csv,' + encodeURIComponent(csv);
-  a.download = 'attention-log.csv';
-  a.click();
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────
-loadFromStorage();
-updateAUPreview();
-render();
-</script>
+<div class="toast" id="toast"></div>
 </body>
 </html>
