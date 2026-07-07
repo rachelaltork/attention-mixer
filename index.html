@@ -129,6 +129,15 @@ function channelAU(channelId, offset) {
     .reduce((s, e) => s + e.au, 0);
 }
 
+function todayAU(channelId) {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const endOfDay = startOfDay + 86400000;
+  return entries
+    .filter(e => e.channelId === channelId && e.ts >= startOfDay && e.ts < endOfDay)
+    .reduce((s, e) => s + e.au, 0);
+}
+
 function auScore(min, intensity) {
   return Math.round((min / 30) * (intensity / 10) * 5 * 100) / 100;
 }
@@ -406,6 +415,14 @@ function makeChannel(ch, vol, isPriority) {
   const goalPx = Math.round(goalPct * fH);
   const goalLine = `<div class="goal-line" style="bottom:${goalPx}px;" title="Weekly goal: ${ch.goal} AU"></div>`;
 
+  // Today indicator
+  const todayVal = todayAU(ch.id);
+  const todayPct = auToFaderPct(todayVal);
+  const todayPx = Math.round(todayPct * fH);
+  const todayLine = todayVal > 0
+    ? `<div class="today-line" style="bottom:${todayPx}px;" title="Today: ${todayVal.toFixed(1)} AU"></div>`
+    : '';
+
   const statusDot = status === 'neglected' ? '<div class="alert-dot" title="Needs attention"></div>'
     : status === 'overflow' ? '<div class="overflow-dot" title="Overflow"></div>'
     : status === 'at-risk' ? '<div class="risk-dot" title="At risk"></div>' : '';
@@ -420,11 +437,13 @@ function makeChannel(ch, vol, isPriority) {
     <div class="fader-outer" style="height:${fH}px;width:${tubeW+12}px;">
       ${ticksHTML}
       ${goalLine}
+      ${todayLine}
       <div class="fader-wrap" style="height:${fH}px;width:${tubeW}px;">
         <div class="fader-fill" style="height:${fillPx}px;background:${fillColor};border-radius:12px;"></div>
       </div>
     </div>
     <div class="vol-label" style="color:${isOverflow?'#BA7517':isZero?'#A32D2D':'var(--color-text-primary)'};">${vol.toFixed(1)}</div>
+    ${todayVal > 0 ? `<div class="today-label">+${todayVal.toFixed(1)} today</div>` : ''}
     <div class="goal-label">${ch.goal} AU goal</div>
     <span class="cadence-badge cadence-${ch.cadence}">${ch.label}</span>
     ${isZero ? '<div class="zero-warn">needs attn</div>' : ''}
@@ -792,6 +811,9 @@ loadFromFirebase().then(() => checkAndCreateSnapshots());
   .tick-line { flex: 1; border-top: 1px dashed rgba(128,128,128,0.3); }
   .tick-val { font-size: 7px; color: var(--color-text-secondary); margin-left: 2px; white-space: nowrap; }
   .goal-line { position: absolute; left: -4px; right: -4px; border-top: 1.5px solid rgba(186,117,23,0.6); pointer-events: none; }
+  .today-line { position: absolute; left: -6px; right: -6px; border-top: 2px solid #7B3FA0; pointer-events: none; z-index: 2; }
+  .today-line::before { content: '▶'; position: absolute; left: -8px; top: -6px; font-size: 8px; color: #7B3FA0; line-height: 1; }
+  .today-label { font-size: 9px; color: #7B3FA0; font-weight: 600; text-align: center; }
   .vol-label { font-size: 11px; font-weight: 500; }
   .goal-label { font-size: 9px; color: var(--color-text-secondary); }
   .alert-dot { width: 6px; height: 6px; border-radius: 50%; background: #E24B4A; position: absolute; top: 6px; right: 6px; }
@@ -879,6 +901,7 @@ loadFromFirebase().then(() => checkAndCreateSnapshots());
     <div class="legend-item"><div class="goal-line-legend"></div> Weekly goal</div>
     <div class="legend-item"><div class="legend-swatch" style="background:#E24B4A;border-radius:50%;"></div> Needs attn</div>
     <div class="legend-item"><div class="legend-swatch" style="background:#E89C2D;border-radius:50%;"></div> At risk</div>
+    <div class="legend-item"><div style="width:20px;border-top:2px solid #7B3FA0;"></div> Today's AU</div>
   </div>
 
   <div id="mixer"></div>
