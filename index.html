@@ -691,7 +691,6 @@ async function submitEntry() {
     await postEntryToSmartsheet(entry, ch);
     entry.ssStatus = 'ok';
     showToast('Saved ✓', 'ok');
-    await checkAndCreateSnapshots();
     render();
   } else {
     showToast('Save failed — check Firebase', 'err');
@@ -751,6 +750,36 @@ function shiftWeek(dir) {
   render();
 }
 
+async function testWebhookPing() {
+  showToast('Sending test ping to Make…');
+  try {
+    await fetch(WEBHOOK, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        type: 'entry',
+        sheetId: SS_LOG_SHEET,
+        channel: 'Intake',
+        cadence: 'weekly',
+        period: 'Week of Jun 23',
+        periodKey: 'week-2026-06-23',
+        datetime: new Date().toISOString(),
+        date: 'Jun 23, 2026',
+        time: '10:00 AM',
+        minutes: 30,
+        intensity: 7,
+        au: 3.5,
+        tags: 'progress',
+        enjoyed: 'Yes',
+        notes: 'Test entry for Make field detection'
+      })
+    });
+    showToast('Ping sent ✓ — check Make', 'ok');
+  } catch(e) {
+    showToast('Ping failed', 'err');
+  }
+}
+
 // Expose to window
 window.shiftWeek = shiftWeek;
 window.togglePanel = togglePanel;
@@ -762,9 +791,10 @@ window.submitEntry = submitEntry;
 window.setFilter = setFilter;
 window.exportCSV = exportCSV;
 window.toggleBottomChart = toggleBottomChart;
+window.testWebhookPing = testWebhookPing;
 
 // Init
-loadFromFirebase().then(() => checkAndCreateSnapshots());
+loadFromFirebase();
 </script>
 <style>
   :root {
@@ -886,6 +916,7 @@ loadFromFirebase().then(() => checkAndCreateSnapshots());
     </div>
     <div class="top-actions">
       <button class="btn-s" id="chart-toggle-btn" onclick="toggleBottomChart()"><i class="ti ti-chart-line"></i> Show trends</button>
+      <button class="btn-s" onclick="testWebhookPing()"><i class="ti ti-plug"></i> Test webhook</button>
       <button class="btn-s" onclick="exportCSV()"><i class="ti ti-download"></i> Export CSV</button>
     </div>
   </div>
