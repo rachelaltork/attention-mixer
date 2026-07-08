@@ -683,18 +683,22 @@ async function submitEntry() {
   };
 
   showToast('Saving…');
-  const saved = await saveEntry(entry);
-  if (saved) {
-    entries.unshift(entry);
-    entry.ssStatus = 'pending';
-    closeAll();
+  // Save to Firebase (don't block on result)
+  saveEntry(entry).catch(e => console.error('Firebase save error:', e));
+  entries.unshift(entry);
+  entry.ssStatus = 'pending';
+  closeAll();
+  render();
+  // Post to Smartsheet via Make webhook
+  try {
     await postEntryToSmartsheet(entry, ch);
     entry.ssStatus = 'ok';
-    showToast('Saved ✓', 'ok');
-    render();
-  } else {
-    showToast('Save failed — check Firebase', 'err');
+  } catch(e) {
+    entry.ssStatus = 'fail';
+    console.error('Webhook error:', e);
   }
+  showToast('Saved ✓', 'ok');
+  render();
 }
 
 function renderLog() {
