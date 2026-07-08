@@ -214,7 +214,7 @@ async function postEntryToSmartsheet(entry, channel) {
     notes: entry.notes || ''
   };
   try {
-    await fetch(WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    await fetch(ssWebhookUrl || WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   } catch(e) {}
 }
 
@@ -238,7 +238,7 @@ async function postSnapshotToSmartsheet(snapshot, channel) {
     priority: channel.priority
   };
   try {
-    await fetch(WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    await fetch(ssWebhookUrl || WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   } catch(e) {}
 }
 
@@ -632,7 +632,11 @@ function togglePanel(id) {
   if (!el) return;
   const wasOpen = el.classList.contains('open');
   closeAll();
-  if (!wasOpen) el.classList.add('open');
+  if (!wasOpen) {
+    el.classList.add('open');
+    if (id === 'manage-panel') renderManage();
+    if (id === 'settings-panel') loadSSSettings();
+  }
 }
 
 function closeAll() {
@@ -698,10 +702,12 @@ async function submitEntry() {
   entry.ssStatus = 'pending';
   closeAll();
   render();
-  // Post to Smartsheet via Make webhook
+  // Post entry + snapshot to Smartsheet via Make webhook
   try {
     await postEntryToSmartsheet(entry, ch);
     entry.ssStatus = 'ok';
+    // Fire snapshot for this channel so dashboard stays current
+    postPeriodSnapshotForChannel(ch).catch(e => console.error('Snapshot error:', e));
   } catch(e) {
     entry.ssStatus = 'fail';
     console.error('Webhook error:', e);
@@ -974,6 +980,180 @@ document.addEventListener('click', (e) => {
   if (modal && e.target === modal) closeEditModal();
 });
 
+// ── Channel management ────────────────────────────────────────────────────
+function renderManage() {
+  const ml = document.getElementById('manage-list');
+  if (!ml) return;
+  ml.innerHTML = CHANNELS.map((ch, i) => `
+    <div style="display:grid;grid-template-columns:2fr 1fr 0.7fr 0.7fr 0.9fr auto;gap:8px;align-items:center;padding:6px 0;border-bottom:0.5px solid var(--color-border-tertiary);">
+      <input type="text" value="${ch.name.replace(/"/g,'&quot;')}" style="font-size:13px;" onchange="editChannel(${i},'name',this.value)">
+      <select style="font-size:12px;" onchange="editChannel(${i},'cadence',this.value)">
+        <option value="weekly"${ch.cadence==='weekly'?' selected':''}>Weekly</option>
+        <option value="monthly"${ch.cadence==='monthly'?' selected':''}>Monthly</option>
+      </select>
+      <select style="font-size:12px;" onchange="editChannel(${i},'priority',parseInt(this.value))">
+        <option value="1"${ch.priority===1?' selected':''}>1</option>
+        <option value="2"${ch.priority===2?' selected':''}>2</option>
+      </select>
+      <input type="number" value="${ch.goal}" min="0.25" step="0.25" style="font-size:12px;" onchange="editChannel(${i},'goal',parseFloat(this.value))">
+      <input type="text" value="${(ch.label||'').replace(/"/g,'&quot;')}" maxlength="8" style="font-size:12px;" onchange="editChannel(${i},'label',this.value)">
+      <button onclick="removeChannel(${i})" style="background:none;border:0.5px solid #F7C1C1;border-radius:4px;padding:4px 8px;font-size:12px;cursor:pointer;color:#A32D2D;font-family:var(--font-sans);"><i class="ti ti-trash"></i></button>
+    </div>`).join('');
+}
+
+function editChannel(idx, field, value) {
+  CHANNELS[idx][field] = value;
+  saveChannelsToStorage();
+  render();
+}
+
+function removeChannel(idx) {
+  const ch = CHANNELS[idx];
+  if (!confirm('Remove channel "' + ch.name + '"? Logged entries will be kept but won't link to this channel.')) return;
+  CHANNELS.splice(idx, 1);
+  saveChannelsToStorage();
+  renderManage();
+  render();
+}
+
+function addChannel() {
+  const name = document.getElementById('new-ch-name').value.trim();
+  const cadence = document.getElementById('new-ch-cadence').value;
+  const priority = parseInt(document.getElementById('new-ch-priority').value);
+  const goal = parseFloat(document.getElementById('new-ch-goal').value) || 4;
+  const label = document.getElementById('new-ch-label').value.trim() || name.slice(0,6);
+  if (!name) return;
+  const id = 'ch_' + Date.now();
+  CHANNELS.push({ id, name, cadence, priority, goal, label });
+  document.getElementById('new-ch-name').value = '';
+  document.getElementById('new-ch-label').value = '';
+  saveChannelsToStorage();
+  renderManage();
+  render();
+}
+
+function saveChannelsToStorage() {
+  try { localStorage.setItem('am_channels', JSON.stringify(CHANNELS)); } catch(e) {}
+}
+
+function loadChannelsFromStorage() {
+  try {
+    const saved = localStorage.getItem('am_channels');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Merge: update existing channels, add new ones
+      parsed.forEach(sc => {
+        const idx = CHANNELS.findIndex(c => c.id === sc.id);
+        if (idx >= 0) Object.assign(CHANNELS[idx], sc);
+        else CHANNELS.push(sc);
+      });
+    }
+  } catch(e) {}
+}
+
+// ── Smartsheet settings ───────────────────────────────────────────────────
+let ssWebhookUrl = 'https://hook.us2.make.com/88giht9207eu9ai1a4dflw6i3lmpqigi';
+
+function loadSSSettings() {
+  try {
+    const w = localStorage.getItem('am_ss_webhook');
+    if (w) ssWebhookUrl = w;
+    const el = document.getElementById('ss-webhook');
+    if (el) el.value = ssWebhookUrl;
+  } catch(e) {}
+}
+
+async function testSSWebhook() {
+  const url = document.getElementById('ss-webhook').value.trim();
+  const bar = document.getElementById('ss-status-bar');
+  bar.style.display = 'block';
+  bar.textContent = 'Testing…';
+  try {
+    const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ test: true }) });
+    bar.className = r.ok ? 'ss-status-bar ss-ok-bar' : 'ss-status-bar ss-fail-bar';
+    bar.textContent = r.ok ? 'Webhook reached ✓' : 'Failed — check the URL';
+  } catch(e) {
+    bar.className = 'ss-status-bar ss-fail-bar';
+    bar.textContent = 'Could not reach webhook';
+  }
+}
+
+function saveSS() {
+  ssWebhookUrl = document.getElementById('ss-webhook').value.trim();
+  try { localStorage.setItem('am_ss_webhook', ssWebhookUrl); } catch(e) {}
+  closeAll();
+  showToast('Smartsheet settings saved', 'ok');
+}
+
+// ── Snapshot on entry save ────────────────────────────────────────────────
+async function postPeriodSnapshotForChannel(ch) {
+  const now = new Date();
+  const { start, end } = ch.cadence === 'weekly'
+    ? weekBounds(0)
+    : { start: new Date(now.getFullYear(), now.getMonth(), 1), end: new Date(now.getFullYear(), now.getMonth()+1, 0, 23, 59, 59, 999) };
+
+  const periodEntries = entries.filter(e =>
+    e.channelId === ch.id && e.ts >= start.getTime() && e.ts <= end.getTime()
+  );
+
+  const totalAU = periodEntries.reduce((s, e) => s + e.au, 0);
+  const totalMinutes = periodEntries.reduce((s, e) => s + e.minutes, 0);
+  const sessions = periodEntries.length;
+  const avgIntensity = sessions ? +(periodEntries.reduce((s, e) => s + e.intensity, 0) / sessions).toFixed(1) : 0;
+  const enjoyedPct = sessions ? Math.round(periodEntries.filter(e => e.enjoyed).length / sessions * 100) : 0;
+  const tagCounts = {};
+  periodEntries.forEach(e => (e.tags||[]).forEach(t => tagCounts[t] = (tagCounts[t]||0)+1));
+  const dominantTag = Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] || '';
+
+  // Pace calculation
+  let pctElapsed;
+  if (ch.cadence === 'weekly') {
+    const day = now.getDay() === 0 ? 7 : now.getDay();
+    pctElapsed = Math.min((day - 1) / 7, 1);
+  } else {
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+    pctElapsed = Math.min((now.getDate() - 1) / daysInMonth, 1);
+  }
+  const expectedAU = ch.goal * pctElapsed;
+  const auPace = expectedAU > 0 ? +(totalAU / expectedAU).toFixed(2) : null;
+  const status = totalAU > ch.goal ? 'Overflow'
+    : auPace === null ? 'No data'
+    : auPace >= 0.8 ? 'On Track'
+    : auPace >= 0.4 ? 'At Risk'
+    : 'Neglected';
+
+  const lastEntry = periodEntries.sort((a,b)=>b.ts-a.ts)[0];
+  const lastLogged = lastEntry ? new Date(lastEntry.ts).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true }) : '';
+
+  const body = {
+    type: 'snapshot',
+    sheetId: SS_LOG_SHEET,
+    dashSheetId: SS_DASH_SHEET,
+    channel: ch.name,
+    cadence: ch.cadence,
+    period: periodLabel(ch, now),
+    periodKey: periodKey(ch, now),
+    periodStart: start.toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric' }),
+    periodEnd: end.toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric' }),
+    totalAU,
+    totalMinutes,
+    sessions,
+    avgIntensity,
+    enjoyedPct,
+    dominantTag,
+    goal: ch.goal,
+    priority: ch.priority,
+    auPace,
+    status,
+    lastLogged,
+    pctElapsed: Math.round(pctElapsed * 100)
+  };
+
+  try {
+    await fetch(ssWebhookUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  } catch(e) { console.error('Snapshot webhook error:', e); }
+}
+
 // Expose to window
 window.shiftWeek = shiftWeek;
 window.togglePanel = togglePanel;
@@ -996,8 +1176,16 @@ window.openChannelMenu = openChannelMenu;
 window.closeChannelMenu = closeChannelMenu;
 window.clearChannelWeek = clearChannelWeek;
 window.clearChannelAll = clearChannelAll;
+window.renderManage = renderManage;
+window.editChannel = editChannel;
+window.removeChannel = removeChannel;
+window.addChannel = addChannel;
+window.testSSWebhook = testSSWebhook;
+window.saveSS = saveSS;
 
 // Init
+loadChannelsFromStorage();
+loadSSSettings();
 loadFromFirebase();
 </script>
 <style>
@@ -1119,9 +1307,9 @@ loadFromFirebase();
       <button onclick="shiftWeek(1)" id="next-btn"><i class="ti ti-chevron-right"></i></button>
     </div>
     <div class="top-actions">
+      <button class="btn-s" onclick="togglePanel('manage-panel')"><i class="ti ti-adjustments-horizontal"></i> Channels</button>
+      <button class="btn-s" onclick="togglePanel('settings-panel')"><i class="ti ti-settings"></i> Smartsheet</button>
       <button class="btn-s" id="chart-toggle-btn" onclick="toggleBottomChart()"><i class="ti ti-chart-line"></i> Show trends</button>
-      <button class="btn-s" onclick="testWebhookPing('entry')"><i class="ti ti-plug"></i> Test entry ping</button>
-      <button class="btn-s" onclick="testWebhookPing('snapshot')"><i class="ti ti-plug"></i> Test snapshot ping</button>
       <button class="btn-s" onclick="exportCSV()"><i class="ti ti-download"></i> Export CSV</button>
     </div>
   </div>
@@ -1183,6 +1371,64 @@ loadFromFirebase();
     <div class="btn-row">
       <button class="btn-s" onclick="closeAll()">Cancel</button>
       <button class="btn-p" onclick="submitEntry()">Save</button>
+    </div>
+  </div>
+
+  <!-- MANAGE CHANNELS PANEL -->
+  <div class="panel" id="manage-panel">
+    <h3>Manage channels</h3>
+    <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:12px;">Edit name, cadence, priority tier, weekly AU goal, or badge label. Changes apply to future entries only.</p>
+    <div style="display:grid;grid-template-columns:2fr 1fr 0.7fr 0.7fr 0.9fr auto;gap:8px;margin-bottom:6px;padding:0 2px;">
+      <span style="font-size:11px;color:var(--color-text-secondary);">Name</span>
+      <span style="font-size:11px;color:var(--color-text-secondary);">Cadence</span>
+      <span style="font-size:11px;color:var(--color-text-secondary);">Priority</span>
+      <span style="font-size:11px;color:var(--color-text-secondary);">AU Goal</span>
+      <span style="font-size:11px;color:var(--color-text-secondary);">Badge</span>
+      <span></span>
+    </div>
+    <div id="manage-list"></div>
+    <hr style="border:none;border-top:0.5px solid var(--color-border-tertiary);margin:12px 0;">
+    <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;font-weight:500;">Add a channel</p>
+    <div style="display:grid;grid-template-columns:2fr 1fr 0.7fr 0.7fr 0.9fr auto;gap:8px;align-items:end;">
+      <div class="field"><label>Name</label><input type="text" id="new-ch-name" placeholder="Channel name"></div>
+      <div class="field"><label>Cadence</label>
+        <select id="new-ch-cadence">
+          <option value="weekly" selected>Weekly</option>
+          <option value="monthly">Monthly</option>
+        </select>
+      </div>
+      <div class="field"><label>Priority</label>
+        <select id="new-ch-priority">
+          <option value="1">1 (high)</option>
+          <option value="2" selected>2 (regular)</option>
+        </select>
+      </div>
+      <div class="field"><label>AU Goal</label><input type="number" id="new-ch-goal" value="4" min="0.25" step="0.25"></div>
+      <div class="field"><label>Badge</label><input type="text" id="new-ch-label" placeholder="e.g. Intake" maxlength="8"></div>
+      <div class="field"><label style="visibility:hidden;">x</label><button class="btn-p" onclick="addChannel()"><i class="ti ti-plus"></i></button></div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
+      <button class="btn-s" onclick="closeAll()">Done</button>
+    </div>
+  </div>
+
+  <!-- SMARTSHEET SETTINGS PANEL -->
+  <div class="panel" id="settings-panel">
+    <h3>Smartsheet connection via Make.com</h3>
+    <p style="font-size:13px;color:var(--color-text-secondary);margin-bottom:14px;line-height:1.6;">
+      Each saved entry posts to your Make.com webhook, which forwards it to Smartsheet automatically.
+    </p>
+    <div style="display:grid;gap:12px;margin-bottom:10px;">
+      <div class="field">
+        <label>Make.com webhook URL<div class="hint" style="margin-bottom:6px;">From your Make scenario → Custom webhook module</div></label>
+        <input type="text" id="ss-webhook" placeholder="https://hook.us2.make.com/...">
+      </div>
+    </div>
+    <div id="ss-status-bar" style="display:none;" class="ss-status-bar"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+      <button class="btn-s" onclick="closeAll()">Cancel</button>
+      <button class="btn-s" onclick="testSSWebhook()"><i class="ti ti-plug"></i> Test</button>
+      <button class="btn-p" onclick="saveSS()">Save</button>
     </div>
   </div>
 
