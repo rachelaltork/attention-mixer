@@ -203,7 +203,7 @@ async function postEntryToSmartsheet(entry, channel) {
     cadence: channel.cadence,
     period: periodLabel(channel, d),
     periodKey: periodKey(channel, d),
-    datetime: d.toISOString(),
+    datetime: d.toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', hour12:true }),
     date: d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }),
     time: d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' }),
     minutes: entry.minutes,
