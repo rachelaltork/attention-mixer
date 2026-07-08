@@ -451,6 +451,7 @@ function makeChannel(ch, vol, isPriority) {
   `;
 
   el.onclick = () => openLog(ch.id);
+  el.oncontextmenu = (e) => { e.preventDefault(); openChannelMenu(ch.id, ch.name, e); };
 
   // Hover sparkline
   el.addEventListener('mouseenter', (e) => showSparkline(ch, e.currentTarget));
@@ -727,12 +728,17 @@ function renderLog() {
     const ds = d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) + ' at ' + d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' });
     const tagPills = (e.tags || []).map(t => `<span class="tag-pill">${t}</span>`).join('');
     const enjoyPill = e.enjoyed ? '<span class="enjoy-pill"><i class="ti ti-heart"></i> enjoyed</span>' : '';
+    const entryId = e.fbId || e.id;
     return `<div class="entry">
       <div class="entry-au">${e.au.toFixed(2)}</div>
       <div style="flex:1">
         <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
           <span class="entry-proj">${ch ? ch.name : e.channelName || '—'}</span>
           <span class="entry-date">${ds}</span>
+          <span style="margin-left:auto;display:flex;gap:4px;">
+            <button onclick="openEditModal('${entryId}')" style="background:none;border:0.5px solid #d0d0cc;border-radius:4px;padding:2px 7px;font-size:11px;cursor:pointer;color:#6b6b6b;font-family:var(--font-sans);" title="Edit entry"><i class="ti ti-pencil"></i></button>
+            <button onclick="deleteEntry('${entryId}')" style="background:none;border:0.5px solid #F7C1C1;border-radius:4px;padding:2px 7px;font-size:11px;cursor:pointer;color:#A32D2D;font-family:var(--font-sans);" title="Delete entry"><i class="ti ti-trash"></i></button>
+          </span>
         </div>
         <div class="entry-meta">${e.minutes}min · ${e.intensity}/10 ${tagPills} ${enjoyPill}</div>
         ${e.notes ? `<div class="entry-notes">${e.notes}</div>` : ''}
@@ -811,6 +817,163 @@ async function testWebhookPing(type) {
   }
 }
 
+// ── Edit / Delete / Channel menu ─────────────────────────────────────────
+let editActiveTags = new Set();
+let channelMenuId = null;
+
+function openEditModal(entryId) {
+  const e = entries.find(x => (x.fbId || x.id) == entryId);
+  if (!e) return;
+  const d = new Date(e.ts);
+  document.getElementById('edit-entry-id').value = entryId;
+  // Date picker: YYYY-MM-DD
+  document.getElementById('edit-date').value = d.toISOString().slice(0,10);
+  // Time picker: HH:MM
+  document.getElementById('edit-time').value = d.toTimeString().slice(0,5);
+  document.getElementById('edit-minutes').value = e.minutes;
+  document.getElementById('edit-intensity').value = e.intensity;
+  document.getElementById('edit-int-display').textContent = e.intensity + '/10';
+  document.getElementById('edit-notes').value = e.notes || '';
+  document.getElementById('edit-enjoy-box').checked = e.enjoyed || false;
+  document.getElementById('edit-enjoy-label').classList.toggle('checked', e.enjoyed || false);
+  // Tags
+  editActiveTags = new Set(e.tags || []);
+  document.querySelectorAll('#edit-tags-wrap .tag-btn').forEach(btn => {
+    const tag = btn.getAttribute('onclick').match(/'([^']+)'\)/)[1];
+    btn.classList.toggle('active', editActiveTags.has(tag));
+  });
+  document.getElementById('edit-modal').style.display = 'flex';
+}
+
+function closeEditModal() {
+  document.getElementById('edit-modal').style.display = 'none';
+}
+
+function toggleEditTag(el, tag) {
+  if (editActiveTags.has(tag)) { editActiveTags.delete(tag); el.classList.remove('active'); }
+  else { editActiveTags.add(tag); el.classList.add('active'); }
+}
+
+function toggleEditEnjoy() {
+  const cb = document.getElementById('edit-enjoy-box');
+  cb.checked = !cb.checked;
+  document.getElementById('edit-enjoy-label').classList.toggle('checked', cb.checked);
+}
+
+async function saveEditEntry() {
+  const entryId = document.getElementById('edit-entry-id').value;
+  const e = entries.find(x => (x.fbId || x.id) == entryId);
+  if (!e) return;
+
+  const dateVal = document.getElementById('edit-date').value;
+  const timeVal = document.getElementById('edit-time').value;
+  const newTs = new Date(dateVal + 'T' + timeVal).getTime();
+  const min = parseInt(document.getElementById('edit-minutes').value) || e.minutes;
+  const intensity = parseInt(document.getElementById('edit-intensity').value) || e.intensity;
+  const notes = document.getElementById('edit-notes').value.trim();
+  const enjoyed = document.getElementById('edit-enjoy-box').checked;
+  const au = auScore(min, intensity);
+
+  e.ts = newTs;
+  e.minutes = min;
+  e.intensity = intensity;
+  e.notes = notes;
+  e.enjoyed = enjoyed;
+  e.tags = Array.from(editActiveTags);
+  e.au = au;
+
+  // Update Firebase
+  if (e.fbId) {
+    try {
+      const { doc, setDoc } = await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js");
+      await setDoc(doc(db, 'attention-mixer-entries', e.fbId), e);
+    } catch(err) { console.error('Firebase update error:', err); }
+  }
+
+  closeEditModal();
+  showToast('Entry updated ✓', 'ok');
+  render();
+}
+
+async function deleteEntry(entryId) {
+  if (!confirm('Delete this entry? This cannot be undone.')) return;
+  const idx = entries.findIndex(x => (x.fbId || x.id) == entryId);
+  if (idx === -1) return;
+  const e = entries[idx];
+
+  if (e.fbId) {
+    try {
+      const { doc, deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js");
+      await deleteDoc(doc(db, 'attention-mixer-entries', e.fbId));
+    } catch(err) { console.error('Firebase delete error:', err); }
+  }
+
+  entries.splice(idx, 1);
+  showToast('Entry deleted', 'ok');
+  render();
+}
+
+function openChannelMenu(channelId, channelName, e) {
+  channelMenuId = channelId;
+  const menu = document.getElementById('channel-menu');
+  document.getElementById('channel-menu-title').textContent = channelName;
+  menu.style.display = 'block';
+  menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + 'px';
+  menu.style.top = Math.min(e.clientY + window.scrollY, window.scrollY + window.innerHeight - 120) + 'px';
+}
+
+function closeChannelMenu() {
+  document.getElementById('channel-menu').style.display = 'none';
+  channelMenuId = null;
+}
+
+async function clearChannelWeek() {
+  if (!channelMenuId) return;
+  const ch = CHANNELS.find(c => c.id === channelMenuId);
+  if (!confirm('Delete all entries for ' + ch.name + ' this week?')) { closeChannelMenu(); return; }
+  const { start, end } = weekBounds(weekOffset);
+  const toDelete = entries.filter(e => e.channelId === channelMenuId && e.ts >= start.getTime() && e.ts <= end.getTime());
+  for (const e of toDelete) {
+    if (e.fbId) {
+      try {
+        const { doc, deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js");
+        await deleteDoc(doc(db, 'attention-mixer-entries', e.fbId));
+      } catch(err) { console.error(err); }
+    }
+  }
+  entries.splice(0, entries.length, ...entries.filter(e => !(e.channelId === channelMenuId && e.ts >= start.getTime() && e.ts <= end.getTime())));
+  closeChannelMenu();
+  showToast('Week cleared for ' + ch.name, 'ok');
+  render();
+}
+
+async function clearChannelAll() {
+  if (!channelMenuId) return;
+  const ch = CHANNELS.find(c => c.id === channelMenuId);
+  if (!confirm('Delete ALL entries for ' + ch.name + ' across all time? This cannot be undone.')) { closeChannelMenu(); return; }
+  const toDelete = entries.filter(e => e.channelId === channelMenuId);
+  for (const e of toDelete) {
+    if (e.fbId) {
+      try {
+        const { doc, deleteDoc } = await import("https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js");
+        await deleteDoc(doc(db, 'attention-mixer-entries', e.fbId));
+      } catch(err) { console.error(err); }
+    }
+  }
+  entries.splice(0, entries.length, ...entries.filter(e => e.channelId !== channelMenuId));
+  closeChannelMenu();
+  showToast('All entries cleared for ' + ch.name, 'ok');
+  render();
+}
+
+// Close menus when clicking outside
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('channel-menu');
+  if (menu && !menu.contains(e.target)) closeChannelMenu();
+  const modal = document.getElementById('edit-modal');
+  if (modal && e.target === modal) closeEditModal();
+});
+
 // Expose to window
 window.shiftWeek = shiftWeek;
 window.togglePanel = togglePanel;
@@ -823,6 +986,16 @@ window.setFilter = setFilter;
 window.exportCSV = exportCSV;
 window.toggleBottomChart = toggleBottomChart;
 window.testWebhookPing = testWebhookPing;
+window.openEditModal = openEditModal;
+window.closeEditModal = closeEditModal;
+window.toggleEditTag = toggleEditTag;
+window.toggleEditEnjoy = toggleEditEnjoy;
+window.saveEditEntry = saveEditEntry;
+window.deleteEntry = deleteEntry;
+window.openChannelMenu = openChannelMenu;
+window.closeChannelMenu = closeChannelMenu;
+window.clearChannelWeek = clearChannelWeek;
+window.clearChannelAll = clearChannelAll;
 
 // Init
 loadFromFirebase();
@@ -1032,6 +1205,65 @@ loadFromFirebase();
     </div>
     <div id="log-list"></div>
   </div>
+</div>
+
+<!-- Edit entry modal -->
+<div id="edit-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.4);z-index:2000;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;padding:1.5rem;width:420px;max-width:95vw;box-shadow:0 8px 32px rgba(0,0,0,0.18);">
+    <h3 style="font-size:14px;font-weight:500;margin-bottom:14px;color:#1a1a1a;">Edit entry</h3>
+    <input type="hidden" id="edit-entry-id">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+      <div>
+        <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:4px;">Date</label>
+        <input type="date" id="edit-date">
+      </div>
+      <div>
+        <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:4px;">Time</label>
+        <input type="time" id="edit-time">
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+      <div>
+        <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:4px;">Duration (minutes)</label>
+        <input type="number" id="edit-minutes" min="1" max="480" step="5">
+      </div>
+      <div>
+        <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:4px;">Intensity <span id="edit-int-display" style="font-weight:500;color:#1a1a1a;">5/10</span></label>
+        <input type="range" min="1" max="10" step="1" id="edit-intensity" style="width:100%;padding:0;border:none;background:transparent;" oninput="document.getElementById('edit-int-display').textContent=this.value+'/10'">
+      </div>
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:6px;">Tags</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;" id="edit-tags-wrap">
+        <button class="tag-btn" onclick="toggleEditTag(this,'progress')"><i class="ti ti-arrow-up-right"></i> Progress</button>
+        <button class="tag-btn" onclick="toggleEditTag(this,'planning')"><i class="ti ti-map"></i> Planning</button>
+        <button class="tag-btn" onclick="toggleEditTag(this,'review')"><i class="ti ti-eye"></i> Review</button>
+        <button class="tag-btn" onclick="toggleEditTag(this,'obstacle')"><i class="ti ti-barrier-block"></i> Obstacle</button>
+        <button class="tag-btn" onclick="toggleEditTag(this,'admin')"><i class="ti ti-briefcase"></i> Admin</button>
+      </div>
+    </div>
+    <label id="edit-enjoy-label" class="enjoy-check" onclick="toggleEditEnjoy()" style="margin-bottom:10px;">
+      <input type="checkbox" id="edit-enjoy-box" onclick="event.stopPropagation();document.getElementById('edit-enjoy-label').classList.toggle('checked',this.checked)">
+      <i class="ti ti-heart" style="font-size:15px;"></i>
+      <span>I enjoyed this work</span>
+    </label>
+    <div style="margin-bottom:14px;">
+      <label style="font-size:12px;color:#6b6b6b;display:block;margin-bottom:4px;">Notes</label>
+      <textarea id="edit-notes" style="resize:vertical;min-height:56px;"></textarea>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn-s" onclick="closeEditModal()">Cancel</button>
+      <button class="btn-p" onclick="saveEditEntry()">Save changes</button>
+    </div>
+  </div>
+</div>
+
+<!-- Channel context menu -->
+<div id="channel-menu" style="display:none;position:fixed;z-index:3000;background:#fff;border:0.5px solid #d0d0cc;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.12);padding:4px 0;min-width:180px;">
+  <div id="channel-menu-title" style="font-size:11px;font-weight:600;color:#6b6b6b;padding:6px 14px 4px;border-bottom:0.5px solid #e8e8e4;margin-bottom:2px;"></div>
+  <button onclick="clearChannelWeek()" style="display:block;width:100%;text-align:left;padding:8px 14px;font-size:13px;background:none;border:none;cursor:pointer;font-family:var(--font-sans);color:#1a1a1a;" onmouseover="this.style.background='#f5f5f3'" onmouseout="this.style.background='none'"><i class="ti ti-calendar-x"></i> Clear this week</button>
+  <button onclick="clearChannelAll()" style="display:block;width:100%;text-align:left;padding:8px 14px;font-size:13px;background:none;border:none;cursor:pointer;font-family:var(--font-sans);color:#A32D2D;" onmouseover="this.style.background='#fcebeb'" onmouseout="this.style.background='none'"><i class="ti ti-trash"></i> Clear all entries</button>
+  <button onclick="closeChannelMenu()" style="display:block;width:100%;text-align:left;padding:8px 14px;font-size:13px;background:none;border:none;cursor:pointer;font-family:var(--font-sans);color:#6b6b6b;" onmouseover="this.style.background='#f5f5f3'" onmouseout="this.style.background='none'">Cancel</button>
 </div>
 
 <!-- Sparkline popup -->
