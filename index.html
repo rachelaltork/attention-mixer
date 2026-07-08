@@ -1009,7 +1009,7 @@ function editChannel(idx, field, value) {
 
 function removeChannel(idx) {
   const ch = CHANNELS[idx];
-  if (!confirm('Remove channel "' + ch.name + '"? Logged entries will be kept but won't link to this channel.')) return;
+  if (!confirm('Remove channel "' + ch.name + '"? Logged entries will be kept but will not link to this channel.')) return;
   CHANNELS.splice(idx, 1);
   saveChannelsToStorage();
   renderManage();
@@ -1294,6 +1294,9 @@ loadFromFirebase();
   .legend-item { display: flex; align-items: center; gap: 5px; }
   .legend-swatch { width: 10px; height: 10px; border-radius: 3px; }
   .goal-line-legend { width: 20px; border-top: 1.5px solid rgba(186,117,23,0.6); }
+  .ss-status-bar { font-size: 12px; padding: 8px 12px; border-radius: var(--border-radius-md); margin-top: 10px; }
+  .ss-ok-bar { background: #E1F5EE; color: #085041; }
+  .ss-fail-bar { background: #FCEBEB; color: #A32D2D; }
 </style>
 </head>
 <body>
