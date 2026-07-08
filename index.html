@@ -750,31 +750,50 @@ function shiftWeek(dir) {
   render();
 }
 
-async function testWebhookPing() {
-  showToast('Sending test ping to Make…');
+async function testWebhookPing(type) {
+  const pingType = type || 'entry';
+  showToast('Sending ' + pingType + ' ping to Make…');
   try {
+    const payload = pingType === 'snapshot' ? {
+      type: 'snapshot',
+      sheetId: SS_LOG_SHEET,
+      dashSheetId: SS_DASH_SHEET,
+      channel: 'Intake',
+      cadence: 'weekly',
+      period: 'Week of Jun 16',
+      periodStart: '2026-06-16T00:00:00.000Z',
+      periodEnd: '2026-06-22T23:59:59.999Z',
+      totalAU: 28.5,
+      totalMinutes: 180,
+      sessions: 6,
+      avgIntensity: 7.2,
+      enjoyedPct: 83,
+      dominantTag: 'progress',
+      goal: 10,
+      priority: 1
+    } : {
+      type: 'entry',
+      sheetId: SS_LOG_SHEET,
+      channel: 'Intake',
+      cadence: 'weekly',
+      period: 'Week of Jun 23',
+      periodKey: 'week-2026-06-23',
+      datetime: new Date().toISOString(),
+      date: 'Jun 23, 2026',
+      time: '10:00 AM',
+      minutes: 30,
+      intensity: 7,
+      au: 3.5,
+      tags: 'progress',
+      enjoyed: 'Yes',
+      notes: 'Test entry for Make field detection'
+    };
     await fetch(WEBHOOK, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        type: 'entry',
-        sheetId: SS_LOG_SHEET,
-        channel: 'Intake',
-        cadence: 'weekly',
-        period: 'Week of Jun 23',
-        periodKey: 'week-2026-06-23',
-        datetime: new Date().toISOString(),
-        date: 'Jun 23, 2026',
-        time: '10:00 AM',
-        minutes: 30,
-        intensity: 7,
-        au: 3.5,
-        tags: 'progress',
-        enjoyed: 'Yes',
-        notes: 'Test entry for Make field detection'
-      })
+      body: JSON.stringify(payload)
     });
-    showToast('Ping sent ✓ — check Make', 'ok');
+    showToast(pingType + ' ping sent ✓ — check Make', 'ok');
   } catch(e) {
     showToast('Ping failed', 'err');
   }
@@ -916,7 +935,8 @@ loadFromFirebase();
     </div>
     <div class="top-actions">
       <button class="btn-s" id="chart-toggle-btn" onclick="toggleBottomChart()"><i class="ti ti-chart-line"></i> Show trends</button>
-      <button class="btn-s" onclick="testWebhookPing()"><i class="ti ti-plug"></i> Test webhook</button>
+      <button class="btn-s" onclick="testWebhookPing('entry')"><i class="ti ti-plug"></i> Test entry ping</button>
+      <button class="btn-s" onclick="testWebhookPing('snapshot')"><i class="ti ti-plug"></i> Test snapshot ping</button>
       <button class="btn-s" onclick="exportCSV()"><i class="ti ti-download"></i> Export CSV</button>
     </div>
   </div>
