@@ -616,13 +616,19 @@ function openLog(channelId) {
 }
 
 function openPanel(id) {
-  ['log-panel','manage-panel','settings-panel'].forEach(p =>
-    document.getElementById(p).classList.toggle('open', p === id));
-  renderMixer();
+  const el = document.getElementById(id);
+  if (el) {
+    ['log-panel','manage-panel','settings-panel'].forEach(p => {
+      const pe = document.getElementById(p);
+      if (pe) pe.classList.toggle('open', p === id);
+    });
+  }
+  render();
 }
 
 function togglePanel(id) {
   const el = document.getElementById(id);
+  if (!el) return;
   const wasOpen = el.classList.contains('open');
   closeAll();
   if (!wasOpen) el.classList.add('open');
@@ -630,8 +636,10 @@ function togglePanel(id) {
 
 function closeAll() {
   selectedChannel = null;
-  ['log-panel','manage-panel','settings-panel'].forEach(p =>
-    document.getElementById(p).classList.remove('open'));
+  ['log-panel','manage-panel','settings-panel'].forEach(p => {
+    const el = document.getElementById(p);
+    if (el) el.classList.remove('open');
+  });
   render();
 }
 
