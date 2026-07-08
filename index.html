@@ -796,7 +796,7 @@ async function testWebhookPing(type) {
       cadence: 'weekly',
       period: 'Week of Jun 23',
       periodKey: 'week-2026-06-23',
-      datetime: new Date().toISOString(),
+      datetime: new Date().toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', hour12:true }),
       date: 'Jun 23, 2026',
       time: '10:00 AM',
       minutes: 30,
